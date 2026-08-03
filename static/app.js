@@ -3,10 +3,11 @@ const state = {
   engine: null, providerStatus: null, jobSource: "示例岗位",
   extensionSequence: 0, extensionImporting: false, extensionPlatforms: [], pendingCapturePlatform: null,
   captureSessionId: createSessionId(), modalReturnFocus: null, sourceMeta: null,
-  radar: null, radarFinalizing: false, resultView: "all"
+  radar: null, radarFinalizing: false, resultView: "all", batchGreetings: [], blockedNotified: false
 };
 const WORKSPACE_STORAGE_KEY = "zhideWorkspaceV2";
 const PROVIDER_STORAGE_KEY = "zhideProviderV1";
+let pendingRadarWindow = null;
 
 const $ = (selector) => document.querySelector(selector);
 const els = {
@@ -20,7 +21,11 @@ const els = {
   locationFilter: $("#locationFilter"), minSalaryPreference: $("#minSalaryPreference"),
   educationFilter: $("#educationFilter"), experienceFilter: $("#experienceFilter"), freshFilter: $("#freshFilter"),
   targetCity: $("#targetCity"), jobKeyword: $("#jobKeyword"), radarPanel: $("#radarPanel"),
-  startRadar: $("#startRadar"), stopRadar: $("#stopRadar"), resultTabs: $("#resultTabs")
+  startRadar: $("#startRadar"), stopRadar: $("#stopRadar"), resumeRadar: $("#resumeRadar"), resultTabs: $("#resultTabs"),
+  autoStartRadar: $("#autoStartRadar"), batchGreeting: $("#batchGreeting"),
+  batchGreetingModal: $("#batchGreetingModal"), batchGreetingList: $("#batchGreetingList"),
+  batchToneTabs: $("#batchToneTabs"), copyAllGreetings: $("#copyAllGreetings"),
+  downloadGreetings: $("#downloadGreetings"), batchGreetingModalClose: $("#batchGreetingModalClose")
 };
 
 bootstrap();
@@ -137,6 +142,8 @@ async function uploadResume(file) {
   if (!valid) return showToast("请上传 DOCX、PDF 或 TXT 文件");
   if (file.size > 8 * 1024 * 1024) return showToast("文件不能超过 8MB");
 
+  closePendingRadarWindow();
+  if (els.autoStartRadar.checked) pendingRadarWindow = window.open("about:blank", "_blank");
   els.uploadSection.classList.add("hidden");
   els.workspace.classList.add("hidden");
   els.loadingPanel.classList.remove("hidden");
@@ -158,13 +165,21 @@ async function uploadResume(file) {
     renderProfile(); setSearchPreferences(); refreshFilterOptions(true); filterAndRender();
     els.loadingPanel.classList.add("hidden");
     showWorkspace(); updateSourceNotice(); saveWorkspace();
+    if (pendingRadarWindow) {
+      const windowRef = pendingRadarWindow;
+      pendingRadarWindow = null;
+      startRadar({ windowRef });
+    }
   } catch (error) {
+    closePendingRadarWindow();
     els.loadingPanel.classList.add("hidden"); els.uploadSection.classList.remove("hidden");
     showToast(error.message);
   } finally { clearInterval(timer); els.fileInput.value = ""; }
 }
 
 async function loadDemo() {
+  closePendingRadarWindow();
+  if (els.autoStartRadar.checked) pendingRadarWindow = window.open("about:blank", "_blank");
   els.uploadSection.classList.add("hidden");
   els.loadingPanel.classList.remove("hidden");
   els.loadingText.textContent = "正在准备示例求职画像…";
@@ -178,10 +193,21 @@ async function loadDemo() {
     renderProfile(); setSearchPreferences(); refreshFilterOptions(true); filterAndRender();
     els.loadingPanel.classList.add("hidden");
     showWorkspace(); updateSourceNotice(); saveWorkspace();
+    if (pendingRadarWindow) {
+      const windowRef = pendingRadarWindow;
+      pendingRadarWindow = null;
+      startRadar({ windowRef });
+    }
   } catch (error) {
+    closePendingRadarWindow();
     els.loadingPanel.classList.add("hidden"); els.uploadSection.classList.remove("hidden");
     showToast(error.message);
   }
+}
+
+function closePendingRadarWindow() {
+  if (pendingRadarWindow && !pendingRadarWindow.closed) pendingRadarWindow.close();
+  pendingRadarWindow = null;
 }
 
 function showWorkspace() {
@@ -490,6 +516,7 @@ document.addEventListener("keydown", event => {
     else if (dialog === els.bossModal) closeBossModal();
     else if (dialog === els.zhaopinModal) closeZhaopinModal();
     else if (dialog === els.extensionModal) closeExtensionModal();
+    else if (dialog === els.batchGreetingModal) hideDialog(els.batchGreetingModal);
     return;
   }
   if (event.key !== "Tab") return;
@@ -513,6 +540,92 @@ $("#copyGreeting").addEventListener("click", async () => {
   if (!els.greetingText.value.trim() || els.greetingText.value === "正在生成…") return showToast("招呼语尚未生成完成");
   try { await navigator.clipboard.writeText(els.greetingText.value); showToast("招呼语已复制，可以去沟通啦"); }
   catch { els.greetingText.select(); document.execCommand("copy"); showToast("招呼语已复制"); }
+});
+
+async function openBatchGreetings() {
+  if (!state.profile) return showToast("请先上传并分析简历");
+  if (!state.visibleJobs.length) return showToast("当前没有可生成的岗位");
+  showDialog(els.batchGreetingModal, "#batchGreetingList");
+  await loadBatchGreetings();
+}
+
+async function loadBatchGreetings() {
+  const jobs = state.visibleJobs.slice(0, 15);
+  els.batchGreetingList.innerHTML = `<p class="batch-loading">正在为 ${jobs.length} 个岗位生成招呼语，请稍候…</p>`;
+  try {
+    const response = await fetchWithTimeout("/api/greetings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: profileForRequest(), jobs, tone: state.tone })
+    }, 120000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "批量生成失败");
+    state.batchGreetings = data.greetings;
+    applyEngine(data.engine, false);
+    renderBatchGreetings();
+  } catch (error) {
+    state.batchGreetings = [];
+    els.batchGreetingList.innerHTML = `<p class="batch-loading error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderBatchGreetings() {
+  const items = state.batchGreetings || [];
+  if (!items.length) {
+    els.batchGreetingList.innerHTML = '<p class="batch-loading">没有生成结果，请检查岗位列表后重试。</p>';
+    return;
+  }
+  els.batchGreetingList.innerHTML = items.map((item, index) => `
+    <article class="batch-greeting-item">
+      <header>
+        <div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.company)}</span></div>
+        <button class="copy-small" data-batch="${index}" type="button">复制</button>
+      </header>
+      <p>${escapeHtml(item.greeting)}</p>
+    </article>
+  `).join("");
+}
+
+els.batchGreeting.addEventListener("click", openBatchGreetings);
+els.batchGreetingModalClose.addEventListener("click", () => hideDialog(els.batchGreetingModal));
+els.batchGreetingModal.addEventListener("click", event => { if (event.target === els.batchGreetingModal) hideDialog(els.batchGreetingModal); });
+els.batchGreetingList.addEventListener("click", async event => {
+  const button = event.target.closest(".copy-small");
+  if (!button) return;
+  const item = (state.batchGreetings || [])[Number(button.dataset.batch)];
+  if (!item) return;
+  try {
+    await navigator.clipboard.writeText(item.greeting);
+    showToast(`已复制「${item.title}」的招呼语`);
+  } catch { showToast("复制失败，请手动选择文本"); }
+});
+els.batchToneTabs.addEventListener("click", event => {
+  const button = event.target.closest("[data-tone]");
+  if (!button) return;
+  state.tone = button.dataset.tone;
+  document.querySelectorAll("#batchToneTabs button").forEach(btn => btn.classList.toggle("active", btn === button));
+  if (visibleDialog() === els.batchGreetingModal) loadBatchGreetings();
+});
+els.copyAllGreetings.addEventListener("click", async () => {
+  const items = state.batchGreetings || [];
+  if (!items.length) return showToast("招呼语尚未生成完成");
+  const text = items.map(item => `${item.title}（${item.company}）\n${item.greeting}`).join("\n\n");
+  try { await navigator.clipboard.writeText(text); showToast(`已复制 ${items.length} 条招呼语`); }
+  catch { showToast("复制失败，请使用“下载 Markdown”"); }
+});
+els.downloadGreetings.addEventListener("click", () => {
+  const items = state.batchGreetings || [];
+  if (!items.length) return showToast("招呼语尚未生成完成");
+  const markdown = items.map(item => `## ${item.title} · ${item.company}\n\n${item.greeting}\n`).join("\n---\n\n");
+  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `招呼语-${new Date().toISOString().slice(0, 10)}.md`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 });
 
 function updateCharCount() { $("#charCount").textContent = `${els.greetingText.value.length} / 300`; }
@@ -568,6 +681,7 @@ function renderRadar() {
     els.startRadar.disabled = false;
     els.startRadar.textContent = "开始自动找工作";
     els.stopRadar.classList.add("hidden");
+    els.resumeRadar.classList.add("hidden");
     return;
   }
   const completed = Number(radar.completed || 0);
@@ -578,12 +692,15 @@ function renderRadar() {
     running: current ? `正在搜索「${current.query}」` : "正在连续采集岗位",
     ready: "采集完成，准备统一匹配",
     paused: "已停止采集，正在整理现有岗位",
+    paused_blocked: "等待处理验证码 / 登录",
     finalized: "本轮岗位雷达已完成",
     error: "岗位雷达未能完成整理",
   }[radar.status] || "正在准备岗位雷达";
   $("#radarTitle").textContent = statusText;
   $("#radarDetail").textContent = radar.status === "error"
     ? (radar.error || "请检查招聘页面或放宽条件后重新开始。")
+    : radar.status === "paused_blocked"
+    ? (radar.blockedReason || "招聘页面需要人工处理，完成后点击“继续雷达”。")
     : radar.status === "running"
     ? `${current?.platformLabel || "招聘平台"} · ${current?.tierLabel || "扩展搜索范围"}`
     : radar.status === "finalized"
@@ -598,9 +715,11 @@ function renderRadar() {
     <div><b>${escapeHtml(group.label)}</b>${group.queries.map(query => `<span>${escapeHtml(query)}</span>`).join("")}</div>
   `).join("");
   const running = radar.status === "running";
+  const blocked = radar.status === "paused_blocked";
   els.startRadar.disabled = running || state.radarFinalizing;
-  els.startRadar.textContent = radar.status === "finalized" ? "开始新一轮搜索" : running ? "岗位雷达运行中" : "重新开始岗位雷达";
+  els.startRadar.textContent = radar.status === "finalized" ? "开始新一轮搜索" : running ? "岗位雷达运行中" : blocked ? "等待恢复" : "重新开始岗位雷达";
   els.stopRadar.classList.toggle("hidden", !running);
+  els.resumeRadar.classList.toggle("hidden", !blocked);
 }
 
 function mergeRadarJobs(incoming) {
@@ -618,19 +737,24 @@ function mergeRadarJobs(incoming) {
   return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 300);
 }
 
-async function startRadar() {
-  if (!state.profile) return showToast("请先上传并分析简历");
+async function startRadar(options = {}) {
+  if (!state.profile) {
+    if (options.windowRef) options.windowRef.close();
+    return showToast("请先上传并分析简历");
+  }
   if (localStorage.getItem("zhideExtensionOnboarded") !== "1") {
+    if (options.windowRef) options.windowRef.close();
     state.pendingCapturePlatform = "radar";
     openExtensionModal();
     return;
   }
-  const searchWindow = window.open("about:blank", "_blank");
-  if (!searchWindow) return showToast("浏览器阻止了搜索页，请允许弹出窗口后重试");
+  const searchWindow = options.windowRef || window.open("about:blank", "_blank");
+  if (!searchWindow || searchWindow.closed) return showToast("浏览器阻止了搜索页，请允许弹出窗口后重试");
   state.captureSessionId = createSessionId();
   state.extensionSequence = 0;
   state.radarFinalizing = false;
   state.resultView = "all";
+  state.blockedNotified = false;
   updateResultTabs();
   els.startRadar.disabled = true;
   els.startRadar.textContent = "正在生成搜索计划…";
@@ -728,12 +852,48 @@ async function checkRadarStatus() {
     state.radar = data.radar;
     renderRadar();
     saveWorkspace();
+    if (state.radar.status === "paused_blocked" && !state.blockedNotified) {
+      state.blockedNotified = true;
+      notifyRadarBlocked(state.radar.blockedReason);
+    } else if (state.radar.status !== "paused_blocked") {
+      state.blockedNotified = false;
+    }
     if (state.radar.status === "ready") await finalizeRadar();
   } catch { /* 本地服务重启后继续等待用户重新开始雷达 */ }
 }
 
+function notifyRadarBlocked(reason) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const notification = new Notification("岗位雷达需要你处理一下", {
+      body: reason || "招聘页面出现验证码或登录要求",
+      tag: "radar-blocked"
+    });
+    notification.onclick = () => { window.focus(); notification.close(); };
+  } catch { /* 通知不可用时静默降级为页面内提示 */ }
+}
+
 els.startRadar.addEventListener("click", startRadar);
 els.stopRadar.addEventListener("click", stopRadar);
+els.resumeRadar.addEventListener("click", resumeRadar);
+
+async function resumeRadar() {
+  if (!state.radar) return;
+  try {
+    const response = await fetch("/api/radar/resume", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.captureSessionId })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "雷达恢复失败");
+    state.radar = data.radar;
+    renderRadar();
+    saveWorkspace();
+    showToast("雷达已恢复，浏览器里的招聘页面会自动继续采集");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
 
 $("#importZhaopin").addEventListener("click", importZhaopinJobs);
 $("#discoverZhaopin").addEventListener("click", () => startExtensionCapture("zhaopin"));

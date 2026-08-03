@@ -158,6 +158,70 @@
     return data;
   }
 
+  function blockedPageReason() {
+    const title = clean(document.title || "");
+    const text = clean(document.body?.innerText || "").slice(0, 8000);
+    const haystack = `${title} ${text}`;
+    if (/(安全验证|验证码|滑动验证|人机验证|请完成验证|captcha)/i.test(haystack)) {
+      return "招聘网站弹出了安全验证，需要你手动完成一次验证后继续";
+    }
+    if (/(扫码登录|立即登录|请登录|登录后才能|账号登录)/i.test(haystack) && /(智联|BOSS|zhaopin|zhipin)/i.test(haystack)) {
+      return "当前页面需要登录招聘网站后才能继续采集，请先完成登录";
+    }
+    return null;
+  }
+
+  async function collectWithRetry(platform, attempts) {
+    let jobs = [];
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      jobs = await scrollAndCollect(platform, true);
+      if (jobs.length) return jobs;
+      if (attempt < attempts) {
+        showRadarStatus(`第 ${attempt} 次未识别到岗位，稍后自动重试…`);
+        await wait(4000 * attempt);
+      }
+    }
+    return jobs;
+  }
+
+  async function reportRadarBlocked(sessionId, taskId, reason) {
+    try {
+      const response = await fetch("http://127.0.0.1:8765/api/radar/blocked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, taskId, reason })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "阻塞上报失败。");
+      return data;
+    } catch (error) {
+      showRadarStatus(`无法连接本地助手：${error.message || "请检查应用是否在运行"}`, "error");
+      return null;
+    }
+  }
+
+  async function watchRadarResume() {
+    const platform = currentPlatform();
+    if (!platform) return;
+    let active;
+    try {
+      const response = await fetch("http://127.0.0.1:8765/api/radar/active", { cache: "no-store" });
+      if (!response.ok) return;
+      active = await response.json();
+    } catch {
+      return;
+    }
+    const radar = active.radar;
+    const task = radar?.currentTask;
+    if (!active.sessionId || !radar?.active || !task) return;
+    const blockedKey = `zhideRadarBlocked:${active.sessionId}:${task.id}`;
+    if (!sessionStorage.getItem(blockedKey)) return;
+    sessionStorage.removeItem(blockedKey);
+    showRadarStatus(`雷达已恢复，正在重新进入「${task.query}」…`);
+    await wait(800);
+    location.assign(task.url);
+  }
+
   async function continueRadar(nextTask, completed, total) {
     if (!nextTask?.url) {
       showRadarStatus(`岗位雷达已完成 ${completed}/${total} 组搜索，正在统一匹配。`, "done");
@@ -191,9 +255,19 @@
     sessionStorage.setItem(runKey, "1");
     showRadarStatus(`岗位雷达 ${radar.completed + 1}/${radar.total}：正在采集「${task.query}」`);
     try {
-      const jobs = await scrollAndCollect(platform, true);
+      const jobs = await collectWithRetry(platform, 3);
       let result;
       if (!jobs.length) {
+        const reason = blockedPageReason();
+        if (reason) {
+          const blocked = await reportRadarBlocked(active.sessionId, task.id, reason);
+          if (blocked?.ok) {
+            sessionStorage.removeItem(runKey);
+            sessionStorage.setItem(`zhideRadarBlocked:${active.sessionId}:${task.id}`, "1");
+            showRadarStatus(reason, "error");
+            return;
+          }
+        }
         result = await sendRadarSkip(active.sessionId, task.id);
       } else {
         const response = await fetch("http://127.0.0.1:8765/api/extension/collect", {
@@ -218,4 +292,5 @@
   }
 
   runRadar();
+  setInterval(watchRadarResume, 6000);
 })();

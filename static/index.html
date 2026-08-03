@@ -46,6 +46,7 @@
           <button class="demo-button" id="tryDemo" type="button">先看示例</button>
         </div>
         <small>支持 DOCX、PDF、TXT · 最大 8MB</small>
+        <label class="auto-radar-option"><input id="autoStartRadar" type="checkbox" checked><span>分析完成后自动开始找工作</span></label>
       </div>
       <div class="privacy-strip">
         <span>⌁</span>
@@ -110,6 +111,7 @@
           <div class="radar-actions">
             <button class="radar-start-button" id="startRadar" type="button">开始自动找工作</button>
             <button class="secondary-button hidden" id="stopRadar" type="button">停止并整理当前岗位</button>
+            <button class="secondary-button hidden" id="resumeRadar" type="button">已处理，继续雷达</button>
           </div>
         </div>
         <section class="radar-panel hidden" id="radarPanel" aria-live="polite">
@@ -156,6 +158,7 @@
             <input id="searchInput" placeholder="搜索职位或公司" aria-label="搜索职位或公司">
           </label>
           <select id="sortSelect" aria-label="结果排序"><option value="score">推荐优先</option><option value="latest">最近采集</option></select>
+          <button class="batch-greeting-button" id="batchGreeting" type="button">批量生成招呼语</button>
         </div>
         <div class="result-tabs" id="resultTabs" aria-label="岗位分组">
           <button class="active" data-view="all" type="button">全部 <span id="allJobCount">0</span></button>
@@ -170,6 +173,26 @@
   </main>
 
   <div class="toast" id="toast" role="status"></div>
+
+  <div class="modal-backdrop hidden" id="batchGreetingModal" role="dialog" aria-modal="true" aria-labelledby="batchGreetingTitle">
+    <div class="modal batch-greeting-modal">
+      <button class="modal-close" id="batchGreetingModalClose" type="button" aria-label="关闭">×</button>
+      <div class="modal-kicker">批量开场白</div>
+      <h2 id="batchGreetingTitle">为当前岗位批量生成招呼语</h2>
+      <p class="modal-subtitle" id="batchGreetingSubtitle">按当前筛选与排序的前 15 个岗位生成，可逐条复制或整体导出。</p>
+      <div class="tone-tabs" id="batchToneTabs">
+        <button class="active" data-tone="professional">专业得体</button>
+        <button data-tone="direct">简洁直接</button>
+        <button data-tone="warm">亲切自然</button>
+      </div>
+      <div class="batch-greeting-list" id="batchGreetingList"></div>
+      <div class="modal-actions">
+        <button class="secondary-button" id="downloadGreetings" type="button">下载 Markdown</button>
+        <button class="primary-button copy-button" id="copyAllGreetings" type="button">复制全部</button>
+      </div>
+      <p class="platform-note">批量招呼语请逐条检查后再发送，避免未经确认的批量投递。</p>
+    </div>
+  </div>
 
   <div class="modal-backdrop hidden" id="extensionModal" role="dialog" aria-modal="true" aria-labelledby="extensionModalTitle">
     <div class="modal extension-modal">

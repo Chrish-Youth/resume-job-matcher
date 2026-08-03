@@ -185,6 +185,33 @@ class ExtensionSessionTests(unittest.TestCase):
         self.assertEqual(len(pool), 1)
         self.assertEqual(pool[0]["searchTier"], first_task["tier"])
 
+    def test_blocked_pauses_and_resume_restarts_task(self):
+        session_id = "capture_radarblocked"
+        profile = {"city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"]}
+        plan = app.generate_search_plan(profile, None, ["zhaopin"])
+        radar = app.start_radar_session(session_id, plan)
+        first_task = radar["currentTask"]
+
+        blocked = app.block_radar_task(session_id, first_task["id"], "招聘网站弹出了安全验证")
+        self.assertEqual(blocked["status"], "paused_blocked")
+        self.assertFalse(blocked["active"])
+        self.assertIn("安全验证", blocked["blockedReason"])
+
+        resumed = app.resume_radar_session(session_id)
+        self.assertEqual(resumed["status"], "running")
+        self.assertTrue(resumed["active"])
+        self.assertNotIn("blockedReason", resumed)
+        self.assertEqual(resumed["currentTask"]["status"], "pending")
+
+    def test_blocked_ignores_stale_task_id(self):
+        session_id = "capture_radarstale"
+        profile = {"city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"]}
+        plan = app.generate_search_plan(profile, None, ["zhaopin"])
+        app.start_radar_session(session_id, plan)
+
+        result = app.block_radar_task(session_id, "radar-not-current", "过期任务")
+        self.assertEqual(result["status"], "running")
+
 
 class HostValidationTests(unittest.TestCase):
     def test_host_header_allowed(self):
@@ -252,6 +279,42 @@ class LlmRetryTests(unittest.TestCase):
 
         self.assertEqual(calls["count"], 1)
         fake_sleep.assert_not_called()
+
+
+class GreetingTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = {
+            "name": "测试用户",
+            "filename": "resume.pdf",
+            "education": "本科",
+            "school": "测试大学",
+            "target": "环境工程方向",
+            "city": "上海",
+            "searchKeyword": "环境工程",
+            "skills": ["环境监测", "数据分析"],
+            "experienceCount": 2,
+            "highlights": ["有环境监测项目经验"],
+        }
+
+    def test_llm_generate_greetings_maps_job_ids(self):
+        jobs = [make_job(1), make_job(2)]
+        fake = json.dumps({
+            "greetings": [
+                {"jobId": "job-1", "text": "您好，我是张三。"},
+                {"jobId": "job-2", "text": "您好，期待与您沟通。"},
+            ]
+        }, ensure_ascii=False)
+        with patch.object(app, "call_llm", return_value=fake):
+            result = app.llm_generate_greetings(self.profile, jobs, "professional", "qwen")
+        self.assertEqual(result["job-1"], "您好，我是张三。")
+        self.assertEqual(result["job-2"], "您好，期待与您沟通。")
+
+    def test_local_greeting_variants_exist(self):
+        job = make_job(1)
+        for tone in ("professional", "direct", "warm"):
+            greeting = app.generate_greeting(self.profile, job, tone)
+            self.assertIn("环境工程师", greeting)
+            self.assertLessEqual(len(greeting), 300)
 
 
 class ZhaopinParserTests(unittest.TestCase):
