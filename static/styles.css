@@ -948,6 +948,19 @@ main { padding: 20px 24px 72px; }
   font-weight: 750;
 }
 .greet-button:hover { background: var(--green-dark); }
+.job-actions { display: flex; flex-direction: column; gap: 8px; }
+.chat-button {
+  min-height: 40px;
+  padding: 0 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--green);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 750;
+}
+.chat-button:hover { border-color: var(--green); background: #f3f8f4; }
+.chat-button:disabled { opacity: .65; cursor: default; }
 .empty-state {
   padding: 52px 20px;
   text-align: center;
@@ -1271,6 +1284,8 @@ main { padding: 20px 24px 72px; }
     text-align: left;
   }
   .greet-button { min-height: 44px; font-size: 14px; }
+  .chat-button { min-height: 44px; font-size: 14px; }
+  .job-actions { flex-direction: row; }
   .salary { font-size: 17px; }
   .modal-backdrop { padding: 10px; align-items: end; }
   .modal { max-height: calc(100vh - 20px); padding: 24px 18px; border-radius: var(--radius-lg) var(--radius-lg) 0 0; }

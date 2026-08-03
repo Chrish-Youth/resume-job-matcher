@@ -316,7 +316,10 @@ function filterAndRender() {
       </div>
       <div class="job-side">
         <div><div class="salary">${escapeHtml(job.salary)}</div><div class="job-meta">${escapeHtml(job.education)} · ${escapeHtml(job.experience)} · ${escapeHtml(job.posted)}</div></div>
-        <button class="greet-button" data-job-id="${job.id}" type="button">✦ 生成招呼语</button>
+        <div class="job-actions">
+          <button class="greet-button" data-job-id="${job.id}" type="button">✦ 生成招呼语</button>
+          <button class="chat-button" data-go-chat-id="${job.id}" type="button">去沟通 ↗</button>
+        </div>
       </div>
     </article>`;
   }).join("");
@@ -449,11 +452,48 @@ function resetFilters(render = true) {
 els.jobList.addEventListener("click", event => {
   const button = event.target.closest("[data-job-id]");
   if (button) openGreeting(button.dataset.jobId);
+  const chatButton = event.target.closest("[data-go-chat-id]");
+  if (chatButton) openAndCopyGreeting(chatButton.dataset.goChatId, chatButton);
 });
+
+async function openAndCopyGreeting(jobId, button) {
+  const job = state.jobs.find(item => item.id === jobId);
+  if (!job) return showToast("岗位已更新，请刷新结果后重试");
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "生成中…";
+  let opened = false;
+  if (job.url) {
+    try { opened = Boolean(window.open(job.url, "_blank")); } catch { opened = false; }
+  }
+  try {
+    const response = await fetchWithTimeout("/api/greeting", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId: job.id, job, profile: profileForRequest(), tone: state.tone, provider: currentProvider() })
+    }, 75000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "生成失败");
+    await navigator.clipboard.writeText(data.greeting);
+    button.textContent = "已复制 ✓";
+    showToast(opened
+      ? "岗位页已打开，招呼语已复制到剪贴板"
+      : job.url
+        ? "招呼语已复制（浏览器可能拦截了新窗口，可点标题打开）"
+        : "招呼语已复制（该岗位暂无页面链接）");
+  } catch (error) {
+    button.textContent = original;
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    setTimeout(() => { button.textContent = "去沟通 ↗"; }, 2500);
+  }
+}
 
 async function openGreeting(jobId) {
   state.activeJob = state.jobs.find(job => job.id === jobId);
   if (!state.activeJob) return showToast("岗位已更新，请刷新结果后重试");
+  $("#openJobPage").classList.toggle("hidden", !state.activeJob.url);
   state.tone = "professional";
   document.querySelectorAll("#toneTabs button").forEach(btn => btn.classList.toggle("active", btn.dataset.tone === state.tone));
   const fit = state.activeJob.fitLabel || fitFromScore(state.activeJob.score).label;
@@ -547,6 +587,10 @@ $("#copyGreeting").addEventListener("click", async () => {
   if (!els.greetingText.value.trim() || els.greetingText.value === "正在生成…") return showToast("招呼语尚未生成完成");
   try { await navigator.clipboard.writeText(els.greetingText.value); showToast("招呼语已复制，可以去沟通啦"); }
   catch { els.greetingText.select(); document.execCommand("copy"); showToast("招呼语已复制"); }
+});
+$("#openJobPage").addEventListener("click", () => {
+  if (!state.activeJob?.url) return showToast("该岗位没有页面链接");
+  window.open(state.activeJob.url, "_blank");
 });
 
 async function openBatchGreetings() {
