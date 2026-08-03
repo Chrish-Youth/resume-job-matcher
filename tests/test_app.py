@@ -1,0 +1,187 @@
+import json
+import re
+import unittest
+from unittest.mock import patch
+
+import app
+
+
+def make_job(index: int, **overrides):
+    job = {
+        "id": f"job-{index}",
+        "title": f"环境工程师 {index}",
+        "company": f"测试企业 {index}",
+        "location": "上海 · 浦东新区",
+        "salary": "8-12K",
+        "education": "本科",
+        "experience": "经验不限",
+        "fresh": True,
+        "logo": "TEST",
+        "logoColor": "#17633f",
+        "tags": ["环境监测", "数据分析"],
+        "description": "负责环境监测、数据整理与报告编制。",
+        "highlights": [],
+        "posted": "今天",
+    }
+    job.update(overrides)
+    return job
+
+
+class MatchingTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = {
+            "name": "测试用户",
+            "filename": "resume.pdf",
+            "preview": "包含个人电话和邮箱的简历预览",
+            "education": "本科",
+            "school": "测试大学",
+            "target": "环境工程方向",
+            "city": "上海",
+            "searchKeyword": "环境工程",
+            "skills": ["环境监测", "数据分析"],
+            "experienceCount": 2,
+            "highlights": ["有环境监测项目经验"],
+        }
+
+    def test_compact_profile_does_not_repeat_resume_preview(self):
+        compact = app.compact_profile_for_llm(self.profile)
+        self.assertNotIn("preview", compact)
+        self.assertNotIn("filename", compact)
+        self.assertNotIn("name", compact)
+        self.assertEqual(compact["target"], "环境工程方向")
+
+    def test_local_score_includes_grade_reasons_and_gaps(self):
+        result = app.score_job(self.profile, make_job(1, tags=["环境监测", "ArcGIS"]))
+        self.assertIn(result["fitGrade"], {"A", "B", "C", "D"})
+        self.assertTrue(result["reasons"])
+        self.assertEqual(result["gaps"], ["ArcGIS"])
+        self.assertEqual(result["matchEngine"], "local")
+
+    def test_llm_matching_scores_every_batch(self):
+        jobs = [make_job(index) for index in range(45)]
+
+        def fake_call(_provider, messages, **_kwargs):
+            ids = re.findall(r'"id":\s*"(job-\d+)"', messages[-1]["content"])
+            return json.dumps({
+                "matches": [
+                    {
+                        "jobId": job_id,
+                        "score": 82,
+                        "matchedTags": ["环境监测"],
+                        "reasons": ["岗位方向与环境监测经历一致"],
+                        "gaps": ["报告编制"],
+                    }
+                    for job_id in ids
+                ]
+            }, ensure_ascii=False)
+
+        with patch.object(app, "call_llm", side_effect=fake_call) as mocked:
+            results, warning = app.llm_match_jobs(self.profile, jobs, "qwen")
+
+        self.assertEqual(mocked.call_count, 3)
+        self.assertEqual(len(results), 45)
+        self.assertIsNone(warning)
+        self.assertTrue(all(job["matchEngine"] == "ai" for job in results))
+        self.assertTrue(all(job["fitGrade"] == "B" for job in results))
+
+    def test_search_plan_expands_three_relevance_tiers(self):
+        plan = app.generate_search_plan(self.profile, None, ["zhaopin", "boss"])
+        tiers = {group["tier"] for group in plan["groups"]}
+        self.assertEqual(tiers, {"exact", "adjacent", "transferable"})
+        self.assertGreaterEqual(len(plan["tasks"]), 10)
+        self.assertTrue(any(task["platform"] == "zhaopin" for task in plan["tasks"]))
+        self.assertTrue(any(task["platform"] == "boss" for task in plan["tasks"]))
+        self.assertTrue(all("上海" in task["city"] for task in plan["tasks"]))
+
+    def test_radar_only_sends_top_sixty_jobs_to_ai(self):
+        jobs = [make_job(index, title=f"环境工程师 {index}") for index in range(80)]
+
+        def fake_match(_profile, finalists, _provider):
+            self.assertEqual(len(finalists), 60)
+            return [{**job, "score": 88, "fitGrade": "A", "fitLabel": "高度匹配", "matchEngine": "ai"} for job in finalists], None
+
+        with patch.object(app, "llm_match_jobs", side_effect=fake_match) as mocked:
+            ranked, excluded, warning = app.finalize_radar_jobs(self.profile, jobs, "qwen")
+
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(len(ranked), 80)
+        self.assertEqual(excluded, 0)
+        self.assertIsNone(warning)
+        self.assertEqual(sum(job["matchEngine"] == "ai" for job in ranked), 60)
+
+
+class PreferenceTests(unittest.TestCase):
+    def test_salary_normalization(self):
+        self.assertEqual(app.salary_midpoint_k("8-12K"), 10)
+        self.assertAlmostEqual(app.salary_midpoint_k("200-300元/天"), 5.4375)
+        self.assertAlmostEqual(app.salary_midpoint_k("24-36万/年"), 25)
+        self.assertIsNone(app.salary_midpoint_k("薪资面议"))
+
+    def test_preferences_filter_before_matching(self):
+        profile = {
+            "city": "上海",
+            "preferences": {"city": "上海", "minSalaryK": 8, "freshOnly": True},
+        }
+        jobs = [
+            make_job(1),
+            make_job(2, location="北京 · 海淀区"),
+            make_job(3, salary="4-6K"),
+            make_job(4, fresh=False),
+            make_job(5, salary="薪资面议"),
+        ]
+        filtered, excluded = app.apply_job_preferences(profile, jobs)
+        self.assertEqual([job["id"] for job in filtered], ["job-1", "job-5"])
+        self.assertEqual(excluded, 3)
+
+
+class ExtensionSessionTests(unittest.TestCase):
+    def setUp(self):
+        with app.EXTENSION_INBOX_LOCK:
+            app.EXTENSION_SESSIONS.clear()
+            app.ACTIVE_EXTENSION_SESSION = None
+
+    def tearDown(self):
+        with app.EXTENSION_INBOX_LOCK:
+            app.EXTENSION_SESSIONS.clear()
+            app.ACTIVE_EXTENSION_SESSION = None
+
+    def test_batches_are_isolated_by_capture_session(self):
+        first = "capture_aaaaaaaaaaaa"
+        second = "capture_bbbbbbbbbbbb"
+
+        app.activate_extension_session(first, "zhaopin")
+        app.enqueue_extension_batch({"platform": "zhaopin", "jobs": [{"title": "岗位一"}]})
+        app.activate_extension_session(second, "boss")
+        app.enqueue_extension_batch({"platform": "boss", "jobs": [{"title": "岗位二"}]})
+
+        first_sequence, first_batches = app.extension_batches_after(first, 0)
+        second_sequence, second_batches = app.extension_batches_after(second, 0)
+
+        self.assertEqual(first_sequence, 1)
+        self.assertEqual(second_sequence, 1)
+        self.assertEqual(first_batches[0]["jobs"][0]["title"], "岗位一")
+        self.assertEqual(second_batches[0]["jobs"][0]["title"], "岗位二")
+        self.assertNotEqual(first_batches[0]["sessionId"], second_batches[0]["sessionId"])
+
+    def test_radar_advances_and_deduplicates_job_pool(self):
+        session_id = "capture_radar123456"
+        profile = {"city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"]}
+        plan = app.generate_search_plan(profile, None, ["zhaopin"])
+        radar = app.start_radar_session(session_id, plan)
+        first_task = radar["currentTask"]
+        duplicate = make_job(1)
+        batch = {"jobs": [duplicate, dict(duplicate)]}
+
+        updated = app.radar_record_batch(session_id, first_task["id"], batch)
+        pool, _ = app.radar_job_pool(session_id)
+
+        self.assertEqual(updated["completed"], 1)
+        self.assertEqual(updated["collected"], 2)
+        self.assertEqual(updated["unique"], 1)
+        self.assertEqual(updated["duplicates"], 1)
+        self.assertEqual(len(pool), 1)
+        self.assertEqual(pool[0]["searchTier"], first_task["tier"])
+
+
+if __name__ == "__main__":
+    unittest.main()

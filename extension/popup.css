@@ -1,0 +1,33 @@
+:root { color-scheme: light; font-family: "Microsoft YaHei", system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; width: 340px; color: #15241b; background: #f7faf7; }
+main { padding: 18px; }
+header { display: flex; align-items: center; gap: 11px; margin-bottom: 16px; }
+header > span { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; color: white; background: #177446; font-size: 21px; font-weight: 800; }
+h1 { margin: 0; font-size: 16px; }
+header p { margin: 3px 0 0; color: #5e6b62; font-size: 12px; }
+.status { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 10px 12px; border: 1px solid #dce8df; border-radius: 11px; background: white; font-size: 13px; line-height: 1.5; }
+.status i { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: #9ba79e; }
+.status.working i { background: #e2a528; box-shadow: 0 0 0 4px #fff1c9; }
+.status.success i { background: #22a164; box-shadow: 0 0 0 4px #dff5e9; }
+.status.error i { background: #d94b4b; box-shadow: 0 0 0 4px #fde5e5; }
+.switch { display: flex; align-items: center; gap: 10px; margin: 14px 0; cursor: pointer; }
+.switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.switch > i { position: relative; width: 36px; height: 20px; border-radius: 20px; background: #bdc7c0; transition: .2s; }
+.switch > i::after { content: ""; position: absolute; width: 16px; height: 16px; top: 2px; left: 2px; border-radius: 50%; background: white; transition: .2s; }
+.switch input:checked + i { background: #1b8351; }
+.switch input:checked + i::after { transform: translateX(16px); }
+.switch input:focus-visible + i { outline: 3px solid #78bd97; outline-offset: 2px; }
+.switch span { display: flex; flex-direction: column; gap: 2px; }
+.switch b { font-size: 13px; }
+.switch small { color: #5e6b62; font-size: 12px; }
+button { width: 100%; height: 44px; border-radius: 10px; font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+button:focus-visible { outline: 3px solid #78bd97; outline-offset: 2px; }
+button:disabled { cursor: wait; opacity: .65; }
+.primary { border: 0; color: white; background: #17633f; }
+.secondary { margin-top: 9px; border: 1px solid #d6e1d9; color: #246c49; background: white; }
+.privacy { margin: 13px 2px 0; color: #5e6b62; font-size: 12px; line-height: 1.55; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .01ms !important; }
+}

@@ -1,0 +1,1062 @@
+const state = {
+  profile: null, jobs: [], visibleJobs: [], activeJob: null, tone: "professional",
+  engine: null, providerStatus: null, jobSource: "示例岗位",
+  extensionSequence: 0, extensionImporting: false, extensionPlatforms: [], pendingCapturePlatform: null,
+  captureSessionId: createSessionId(), modalReturnFocus: null, sourceMeta: null,
+  radar: null, radarFinalizing: false, resultView: "all"
+};
+const WORKSPACE_STORAGE_KEY = "zhideWorkspaceV2";
+const PROVIDER_STORAGE_KEY = "zhideProviderV1";
+
+const $ = (selector) => document.querySelector(selector);
+const els = {
+  uploadSection: $("#uploadSection"), dropZone: $("#dropZone"), fileInput: $("#fileInput"),
+  chooseFile: $("#chooseFile"), loadingPanel: $("#loadingPanel"), loadingText: $("#loadingText"),
+  workspace: $("#workspace"), jobList: $("#jobList"), emptyState: $("#emptyState"),
+  searchInput: $("#searchInput"), sortSelect: $("#sortSelect"), modal: $("#greetingModal"),
+  greetingText: $("#greetingText"), charCount: $("#charCount"), toast: $("#toast"),
+  providerSelect: $("#providerSelect"), enginePill: $("#enginePill"), bossModal: $("#bossModal"), zhaopinModal: $("#zhaopinModal"),
+  extensionModal: $("#extensionModal"), captureStatus: $("#captureStatus"),
+  locationFilter: $("#locationFilter"), minSalaryPreference: $("#minSalaryPreference"),
+  educationFilter: $("#educationFilter"), experienceFilter: $("#experienceFilter"), freshFilter: $("#freshFilter"),
+  targetCity: $("#targetCity"), jobKeyword: $("#jobKeyword"), radarPanel: $("#radarPanel"),
+  startRadar: $("#startRadar"), stopRadar: $("#stopRadar"), resultTabs: $("#resultTabs")
+};
+
+bootstrap();
+
+async function bootstrap() {
+  await loadProviderStatus();
+  restoreWorkspace();
+}
+
+function createSessionId() {
+  if (globalThis.crypto?.randomUUID) return `capture_${crypto.randomUUID().replaceAll("-", "")}`;
+  return `capture_${Date.now()}_${Math.random().toString(36).slice(2, 14)}`;
+}
+
+function currentPreferences() {
+  return {
+    city: els.targetCity.value || "全国",
+    keyword: els.jobKeyword.value.trim(),
+    minSalaryK: Number(els.minSalaryPreference.value || 0),
+    freshOnly: els.freshFilter.checked
+  };
+}
+
+function profileForRequest() {
+  return { ...state.profile, preferences: currentPreferences() };
+}
+
+function saveWorkspace() {
+  if (!state.profile || !state.jobs.length) return;
+  try {
+    const profile = { ...state.profile };
+    delete profile.preview;
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      savedAt: Date.now(),
+      profile,
+      jobs: state.jobs.slice(0, 300),
+      engine: state.engine,
+      jobSource: state.jobSource,
+      sourceMeta: state.sourceMeta,
+      extensionPlatforms: state.extensionPlatforms,
+      captureSessionId: state.captureSessionId,
+      radar: state.radar,
+      resultView: state.resultView,
+      preferences: currentPreferences(),
+      filters: {
+        location: els.locationFilter.value,
+        education: els.educationFilter.value,
+        experience: els.experienceFilter.value,
+        search: els.searchInput.value,
+        sort: els.sortSelect.value
+      }
+    }));
+    $("#clearWorkspace").classList.remove("hidden");
+  } catch { /* 存储空间不足时仍允许继续使用当前会话 */ }
+}
+
+function restoreWorkspace() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(WORKSPACE_STORAGE_KEY) || "null"); }
+  catch { saved = null; }
+  if (!saved || ![2, 3].includes(saved.version) || !saved.profile || !Array.isArray(saved.jobs) || !saved.jobs.length) return;
+  state.profile = saved.profile;
+  state.jobs = saved.jobs;
+  state.visibleJobs = saved.jobs;
+  state.engine = saved.engine || null;
+  state.jobSource = saved.jobSource || "已保存岗位";
+  state.sourceMeta = saved.sourceMeta || null;
+  state.extensionPlatforms = Array.isArray(saved.extensionPlatforms) ? saved.extensionPlatforms : [];
+  if (saved.captureSessionId) state.captureSessionId = saved.captureSessionId;
+  state.radar = saved.radar || null;
+  state.resultView = ["all", "strong", "transferable", "new"].includes(saved.resultView) ? saved.resultView : "all";
+  renderProfile();
+  setSearchPreferences(saved.preferences);
+  refreshFilterOptions(true);
+  const filters = saved.filters || {};
+  if ([...els.locationFilter.options].some(option => option.value === filters.location)) els.locationFilter.value = filters.location;
+  if ([...els.educationFilter.options].some(option => option.value === filters.education)) els.educationFilter.value = filters.education;
+  if ([...els.experienceFilter.options].some(option => option.value === filters.experience)) els.experienceFilter.value = filters.experience;
+  els.searchInput.value = filters.search || "";
+  els.sortSelect.value = filters.sort === "latest" ? "latest" : "score";
+  if (state.engine) applyEngine(state.engine, false);
+  filterAndRender();
+  renderRadar();
+  updateResultTabs();
+  showWorkspace();
+  updateSourceNotice();
+  $("#clearWorkspace").classList.remove("hidden");
+  showToast("已恢复上次保存在本机的求职工作区");
+}
+
+function clearWorkspace() {
+  localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+  window.location.reload();
+}
+
+$("#clearWorkspace").addEventListener("click", clearWorkspace);
+
+els.chooseFile.addEventListener("click", () => els.fileInput.click());
+$("#tryDemo").addEventListener("click", loadDemo);
+$("#replaceFile").addEventListener("click", () => els.fileInput.click());
+els.fileInput.addEventListener("change", () => els.fileInput.files[0] && uploadResume(els.fileInput.files[0]));
+
+["dragenter", "dragover"].forEach(type => els.dropZone.addEventListener(type, event => {
+  event.preventDefault(); els.dropZone.classList.add("dragging");
+}));
+["dragleave", "drop"].forEach(type => els.dropZone.addEventListener(type, event => {
+  event.preventDefault(); els.dropZone.classList.remove("dragging");
+}));
+els.dropZone.addEventListener("drop", event => event.dataTransfer.files[0] && uploadResume(event.dataTransfer.files[0]));
+
+async function uploadResume(file) {
+  const valid = ["docx", "pdf", "txt"].includes(file.name.split(".").pop().toLowerCase());
+  if (!valid) return showToast("请上传 DOCX、PDF 或 TXT 文件");
+  if (file.size > 8 * 1024 * 1024) return showToast("文件不能超过 8MB");
+
+  els.uploadSection.classList.add("hidden");
+  els.workspace.classList.add("hidden");
+  els.loadingPanel.classList.remove("hidden");
+  const isPdf = file.name.toLowerCase().endsWith(".pdf");
+  const messages = isPdf
+    ? ["正在解析 PDF 页面文字…", "提取教育与经历信息…", "识别技能并计算岗位匹配度…"]
+    : ["提取教育与经历信息…", "识别技能与求职方向…", "正在计算岗位匹配度…"];
+  let index = 0;
+  const timer = setInterval(() => { els.loadingText.textContent = messages[++index % messages.length]; }, 850);
+
+  try {
+    const form = new FormData(); form.append("resume", file);
+    const response = await fetchWithTimeout(`/api/analyze?provider=${encodeURIComponent(currentProvider())}`, { method: "POST", body: form }, 90000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "简历解析失败");
+    state.profile = data.profile; state.jobs = data.jobs; state.visibleJobs = data.jobs; state.jobSource = "示例岗位"; state.extensionPlatforms = []; state.sourceMeta = null;
+    state.captureSessionId = createSessionId(); state.extensionSequence = 0; state.radar = null; state.resultView = "all";
+    applyEngine(data.engine);
+    renderProfile(); setSearchPreferences(); refreshFilterOptions(true); filterAndRender();
+    els.loadingPanel.classList.add("hidden");
+    showWorkspace(); updateSourceNotice(); saveWorkspace();
+  } catch (error) {
+    els.loadingPanel.classList.add("hidden"); els.uploadSection.classList.remove("hidden");
+    showToast(error.message);
+  } finally { clearInterval(timer); els.fileInput.value = ""; }
+}
+
+async function loadDemo() {
+  els.uploadSection.classList.add("hidden");
+  els.loadingPanel.classList.remove("hidden");
+  els.loadingText.textContent = "正在准备示例求职画像…";
+  try {
+    const response = await fetchWithTimeout(`/api/demo?provider=${encodeURIComponent(currentProvider())}`, { method: "POST" }, 90000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "示例加载失败");
+    state.profile = data.profile; state.jobs = data.jobs; state.visibleJobs = data.jobs; state.jobSource = "示例岗位"; state.extensionPlatforms = []; state.sourceMeta = null;
+    state.captureSessionId = createSessionId(); state.extensionSequence = 0; state.radar = null; state.resultView = "all";
+    applyEngine(data.engine);
+    renderProfile(); setSearchPreferences(); refreshFilterOptions(true); filterAndRender();
+    els.loadingPanel.classList.add("hidden");
+    showWorkspace(); updateSourceNotice(); saveWorkspace();
+  } catch (error) {
+    els.loadingPanel.classList.add("hidden"); els.uploadSection.classList.remove("hidden");
+    showToast(error.message);
+  }
+}
+
+function showWorkspace() {
+  els.uploadSection.classList.add("hidden");
+  els.loadingPanel.classList.add("hidden");
+  els.workspace.classList.remove("hidden");
+  $("#hero").classList.add("hidden");
+  document.body.classList.add("workspace-mode");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
+}
+
+function renderProfile() {
+  const p = state.profile;
+  $("#avatar").textContent = p.name.slice(0, 1);
+  $("#profileName").textContent = p.name;
+  $("#profileTarget").textContent = p.target;
+  $("#profileFile").textContent = p.filename;
+  $("#fileType").textContent = (p.filename.split(".").pop() || "DOC").toUpperCase().slice(0, 4);
+  $("#profileEducation").textContent = p.education;
+  $("#experienceCount").textContent = p.experienceCount;
+  $("#skillCount").textContent = p.skills.length;
+  $("#skillList").innerHTML = p.skills.length
+    ? p.skills.map(skill => `<span>${escapeHtml(skill)}</span>`).join("")
+    : "<span>待补充</span>";
+  $("#profileTip").textContent = p.highlights[0] || "已根据简历信息完成岗位匹配。";
+}
+
+function setSearchPreferences(savedPreferences = null) {
+  const rawCity = String(savedPreferences?.city || state.profile?.city || "全国").replace(/市$/, "");
+  const city = rawCity && rawCity !== "待确认" ? rawCity : "全国";
+  if (![...els.targetCity.options].some(option => option.value === city)) els.targetCity.add(new Option(city, city));
+  els.targetCity.value = city;
+  const keyword = String(savedPreferences?.keyword || state.profile?.searchKeyword || state.profile?.target || "")
+    .replace(/相关岗位|方向|求职/g, "").replace(/\s*\/\s*/g, " ").trim();
+  els.jobKeyword.value = keyword.slice(0, 30);
+  els.minSalaryPreference.value = String(savedPreferences?.minSalaryK || 0);
+  els.freshFilter.checked = Boolean(savedPreferences?.freshOnly);
+  syncManualBossUrl();
+}
+
+function filterAndRender() {
+  const keyword = els.searchInput.value.trim().toLowerCase();
+  const targetCity = els.targetCity.value;
+  const location = els.locationFilter.value;
+  const minSalary = Number(els.minSalaryPreference.value || 0);
+  const education = els.educationFilter.value;
+  const experience = els.experienceFilter.value;
+  let jobs = state.jobs.filter(job => {
+    if (!`${job.title}${job.company}${job.location}`.toLowerCase().includes(keyword)) return false;
+    if (targetCity !== "全国" && jobCity(job) !== targetCity) return false;
+    if (location !== "all" && jobCity(job) !== location) return false;
+    const salary = salaryMidpointK(job.salary);
+    if (minSalary && salary !== null && salary < minSalary) return false;
+    if (education !== "all" && normalizeEducation(job.education) !== education) return false;
+    if (experience !== "all" && normalizeExperience(job.experience) !== experience) return false;
+    if (els.freshFilter.checked && !job.fresh) return false;
+    return true;
+  });
+  const baseJobs = jobs;
+  const strongJobs = baseJobs.filter(job => ["A", "B"].includes(job.fitGrade || fitFromScore(job.score).grade));
+  const transferableJobs = baseJobs.filter(job => job.searchTier === "transferable" || (job.fitGrade || fitFromScore(job.score).grade) === "C");
+  const newJobs = baseJobs.filter(job => job.isNew);
+  $("#allJobCount").textContent = baseJobs.length;
+  $("#strongJobCount").textContent = strongJobs.length;
+  $("#transferJobCount").textContent = transferableJobs.length;
+  $("#newJobCount").textContent = newJobs.length;
+  if (state.resultView === "strong") jobs = strongJobs;
+  else if (state.resultView === "transferable") jobs = transferableJobs;
+  else if (state.resultView === "new") jobs = newJobs;
+  if (els.sortSelect.value === "score") jobs.sort((a, b) => b.score - a.score);
+  else jobs.sort((a, b) => (Number(b.capturedAt || 0) - Number(a.capturedAt || 0)) || (postedRank(b.posted) - postedRank(a.posted)));
+  state.visibleJobs = jobs;
+  $("#jobCount").textContent = jobs.length;
+  els.emptyState.classList.toggle("hidden", jobs.length > 0);
+  updateFilterAppearance();
+  $("#emptyHint").textContent = state.resultView !== "all"
+    ? "这个分组暂时没有岗位，切换到“全部”继续查看。"
+    : activeFilterCount() ? "试试放宽或重置筛选条件。" : "换个职位或公司关键词试试。";
+  els.jobList.innerHTML = jobs.map(job => {
+    const fit = job.fitGrade && job.fitLabel ? { grade: job.fitGrade, label: job.fitLabel } : fitFromScore(job.score);
+    const matchedTags = Array.isArray(job.matchedTags) ? job.matchedTags : [];
+    const reasons = Array.isArray(job.reasons) && job.reasons.length ? job.reasons.slice(0, 2) : ["建议打开原岗位核对职责与要求"];
+    const gaps = Array.isArray(job.gaps) ? job.gaps.slice(0, 2) : [];
+    const source = job.source || state.jobSource;
+    const logoColor = /^#[0-9a-f]{6}$/i.test(String(job.logoColor || "")) ? job.logoColor : "#17633f";
+    return `
+    <article class="job-card" data-grade="${escapeHtml(fit.grade)}">
+      <div class="company-logo" style="background:${logoColor}">${escapeHtml(job.logo)}</div>
+      <div class="job-main">
+        <div class="job-title-row"><h3>${job.url ? `<a href="${escapeHtml(job.url)}" target="_blank" rel="noopener">${escapeHtml(job.title)}</a>` : escapeHtml(job.title)}</h3><span class="fit-badge"><b>${escapeHtml(fit.grade)}</b>${escapeHtml(fit.label)}</span>${job.isNew ? '<span class="new-badge">本轮新增</span>' : ""}</div>
+        <div class="company-line"><span>${escapeHtml(job.company)}</span><i></i><span>${escapeHtml(job.location)}</span></div>
+        <div class="job-tags">${job.tags.map(tag => `<span class="${matchedTags.includes(tag) ? "matched" : ""}">${escapeHtml(tag)}</span>`).join("")}</div>
+        <div class="match-explain">
+          <div><b>推荐依据</b><span>${reasons.map(escapeHtml).join("；")}</span></div>
+          ${gaps.length ? `<div class="gap-line"><b>需要核对</b><span>${gaps.map(escapeHtml).join("、")}</span></div>` : ""}
+        </div>
+        <div class="job-source">${job.searchTierLabel ? `${escapeHtml(job.searchTierLabel)} · ` : ""}${job.searchQuery ? `搜索「${escapeHtml(job.searchQuery)}」 · ` : ""}${escapeHtml(source)} · ${job.matchEngine === "ai" ? "AI 评估" : "本地规则"}</div>
+      </div>
+      <div class="job-side">
+        <div><div class="salary">${escapeHtml(job.salary)}</div><div class="job-meta">${escapeHtml(job.education)} · ${escapeHtml(job.experience)} · ${escapeHtml(job.posted)}</div></div>
+        <button class="greet-button" data-job-id="${job.id}" type="button">✦ 生成招呼语</button>
+      </div>
+    </article>`;
+  }).join("");
+}
+
+function updateResultTabs() {
+  els.resultTabs.querySelectorAll("button").forEach(button => {
+    const active = button.dataset.view === state.resultView;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+els.resultTabs.addEventListener("click", event => {
+  const button = event.target.closest("button[data-view]");
+  if (!button) return;
+  state.resultView = button.dataset.view;
+  updateResultTabs();
+  filterAndRender();
+  saveWorkspace();
+});
+
+els.searchInput.addEventListener("input", filterAndRender);
+els.sortSelect.addEventListener("change", filterAndRender);
+[els.locationFilter, els.educationFilter, els.experienceFilter]
+  .forEach(control => control.addEventListener("change", () => { filterAndRender(); saveWorkspace(); }));
+[els.targetCity, els.minSalaryPreference, els.freshFilter]
+  .forEach(control => control.addEventListener("change", () => {
+    syncManualBossUrl(); filterAndRender(); updateSourceNotice(); saveWorkspace();
+  }));
+els.jobKeyword.addEventListener("input", () => { syncManualBossUrl(); saveWorkspace(); });
+els.searchInput.addEventListener("change", saveWorkspace);
+els.sortSelect.addEventListener("change", saveWorkspace);
+$("#resetFilters").addEventListener("click", () => resetFilters(true));
+
+function jobCity(job) {
+  const value = String(job.location || "").trim();
+  if (!value || value.includes("待确认")) return "待确认";
+  for (const city of ["北京", "上海", "天津", "重庆"]) if (value.startsWith(city)) return city;
+  const cityMatch = value.match(/^(.{2,8}?(?:市|自治州|地区|盟))/);
+  if (cityMatch) return cityMatch[1].replace(/市$/, "");
+  return value.split(/[·\s]/)[0];
+}
+
+function normalizeEducation(value) {
+  const text = String(value || "");
+  for (const item of ["博士", "硕士", "本科", "大专", "中专/中技", "高中"]) if (text.includes(item)) return item;
+  if (text.includes("中专")) return "中专/中技";
+  if (text.includes("不限")) return "不限";
+  return text.trim() || "待确认";
+}
+
+function normalizeExperience(value) {
+  const text = String(value || "").trim();
+  if (/在校|应届/.test(text)) return "在校/应届";
+  if (!text || /不限/.test(text)) return "经验不限";
+  return text;
+}
+
+function salaryMidpointK(value) {
+  const text = String(value || "").replace(/,/g, "");
+  if (/面议|待确认/.test(text) || !text) return null;
+  const numbers = (text.match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  if (!numbers.length) return null;
+  let values = numbers.slice(0, 2);
+  let midpoint = values.reduce((sum, number) => sum + number, 0) / values.length;
+  if (/元\s*\/?\s*(天|日)/.test(text)) midpoint = midpoint * 21.75 / 1000;
+  else if (/元\s*\/?\s*(小时|时)/.test(text)) midpoint = midpoint * 8 * 21.75 / 1000;
+  else if (/万/.test(text)) midpoint *= 10;
+  else if (/元/.test(text) && midpoint >= 100) midpoint /= 1000;
+  if (/\/\s*年|年薪/.test(text)) midpoint /= 12;
+  return midpoint;
+}
+
+function postedRank(value) {
+  const text = String(value || "");
+  if (/刚刚/.test(text)) return 100000;
+  if (/今天|今日/.test(text)) return 90000;
+  if (/昨天/.test(text)) return 70000;
+  const minutes = text.match(/(\d+)\s*分钟前/);
+  if (minutes) return 95000 - Number(minutes[1]);
+  const hours = text.match(/(\d+)\s*小时前/);
+  if (hours) return 90000 - Number(hours[1]) * 60;
+  const days = text.match(/(\d+)\s*天前/);
+  if (days) return 70000 - Number(days[1]) * 1440;
+  return 0;
+}
+
+function fitFromScore(score) {
+  if (score >= 86) return { grade: "A", label: "高度匹配" };
+  if (score >= 74) return { grade: "B", label: "值得尝试" };
+  if (score >= 62) return { grade: "C", label: "能力可迁移" };
+  return { grade: "D", label: "匹配较弱" };
+}
+
+function setDynamicOptions(select, values, allLabel, order = []) {
+  select.replaceChildren(new Option(allLabel, "all"));
+  const unique = [...new Set(values.filter(Boolean))];
+  unique.sort((a, b) => {
+    const left = order.indexOf(a), right = order.indexOf(b);
+    if (left >= 0 || right >= 0) return (left < 0 ? 999 : left) - (right < 0 ? 999 : right);
+    return a.localeCompare(b, "zh-CN");
+  });
+  unique.forEach(value => select.add(new Option(value, value)));
+}
+
+function refreshFilterOptions(reset = false) {
+  if (reset) resetFilters(false);
+  setDynamicOptions(els.locationFilter, state.jobs.map(jobCity), "全部地点");
+  setDynamicOptions(els.educationFilter, state.jobs.map(job => normalizeEducation(job.education)), "全部学历", ["不限", "中专/中技", "高中", "大专", "本科", "硕士", "博士"]);
+  setDynamicOptions(els.experienceFilter, state.jobs.map(job => normalizeExperience(job.experience)), "全部经验", ["经验不限", "在校/应届", "1年以内", "1-3年", "3-5年", "5-10年"]);
+}
+
+function activeFilterCount() {
+  return [els.locationFilter, els.educationFilter, els.experienceFilter].filter(select => select.value !== "all").length;
+}
+
+function updateFilterAppearance() {
+  const count = activeFilterCount();
+  const badge = $("#activeFilterCount");
+  badge.textContent = count; badge.classList.toggle("hidden", count === 0);
+  [els.locationFilter, els.educationFilter, els.experienceFilter]
+    .forEach(select => select.classList.toggle("active", select.value !== "all"));
+}
+
+function resetFilters(render = true) {
+  [els.locationFilter, els.educationFilter, els.experienceFilter].forEach(select => { select.value = "all"; });
+  if (render) { filterAndRender(); saveWorkspace(); } else updateFilterAppearance();
+}
+els.jobList.addEventListener("click", event => {
+  const button = event.target.closest("[data-job-id]");
+  if (button) openGreeting(button.dataset.jobId);
+});
+
+async function openGreeting(jobId) {
+  state.activeJob = state.jobs.find(job => job.id === jobId);
+  if (!state.activeJob) return showToast("岗位已更新，请刷新结果后重试");
+  state.tone = "professional";
+  document.querySelectorAll("#toneTabs button").forEach(btn => btn.classList.toggle("active", btn.dataset.tone === state.tone));
+  const fit = state.activeJob.fitLabel || fitFromScore(state.activeJob.score).label;
+  $("#modalJob").textContent = `${state.activeJob.company} · ${state.activeJob.title} · ${fit}`;
+  $("#platformNote").textContent = state.activeJob.source?.includes("BOSS")
+    ? "可粘贴到 BOSS 直聘的聊天对话框中"
+    : "可粘贴到智联招聘的「立即沟通」对话框中";
+  const matchedTags = Array.isArray(state.activeJob.matchedTags) ? state.activeJob.matchedTags : [];
+  $("#matchBasis").innerHTML = (matchedTags.length ? matchedTags : state.profile.skills.slice(0, 2))
+    .map(item => `<span>✓ ${escapeHtml(item)}</span>`).join("");
+  showDialog(els.modal, "#modalClose");
+  await generateGreeting();
+}
+
+async function generateGreeting() {
+  const controls = [$("#regenerate"), $("#copyGreeting"), ...document.querySelectorAll("#toneTabs button")];
+  controls.forEach(control => { control.disabled = true; });
+  els.greetingText.value = "正在生成…"; updateCharCount();
+  try {
+    const response = await fetchWithTimeout("/api/greeting", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId: state.activeJob.id, job: state.activeJob, profile: profileForRequest(), tone: state.tone, provider: currentProvider() })
+    }, 75000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "生成失败");
+    els.greetingText.value = data.greeting; updateCharCount();
+    applyEngine(data.engine, false);
+  } catch (error) {
+    els.greetingText.value = "";
+    showToast(error.name === "AbortError" ? "生成超时，请重试或切换模型" : error.message);
+  } finally {
+    controls.forEach(control => { control.disabled = false; });
+  }
+}
+
+function showDialog(element, focusSelector = "button, input, textarea, select") {
+  state.modalReturnFocus = document.activeElement;
+  element.classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  requestAnimationFrame(() => element.querySelector(focusSelector)?.focus());
+}
+
+function hideDialog(element) {
+  element.classList.add("hidden");
+  const openDialog = document.querySelector(".modal-backdrop:not(.hidden)");
+  if (!openDialog) {
+    document.body.style.overflow = "";
+    if (state.modalReturnFocus instanceof HTMLElement) state.modalReturnFocus.focus();
+    state.modalReturnFocus = null;
+  }
+}
+
+function visibleDialog() {
+  return document.querySelector(".modal-backdrop:not(.hidden)");
+}
+
+function closeModal() { hideDialog(els.modal); }
+$("#modalClose").addEventListener("click", closeModal);
+els.modal.addEventListener("click", event => { if (event.target === els.modal) closeModal(); });
+document.addEventListener("keydown", event => {
+  const dialog = visibleDialog();
+  if (!dialog) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (dialog === els.modal) closeModal();
+    else if (dialog === els.bossModal) closeBossModal();
+    else if (dialog === els.zhaopinModal) closeZhaopinModal();
+    else if (dialog === els.extensionModal) closeExtensionModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [...dialog.querySelectorAll("button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")]
+    .filter(node => node.getClientRects().length);
+  if (!focusable.length) return;
+  const first = focusable[0], last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+});
+$("#toneTabs").addEventListener("click", event => {
+  const button = event.target.closest("[data-tone]"); if (!button) return;
+  state.tone = button.dataset.tone;
+  document.querySelectorAll("#toneTabs button").forEach(btn => btn.classList.toggle("active", btn === button));
+  generateGreeting();
+});
+$("#regenerate").addEventListener("click", generateGreeting);
+els.greetingText.addEventListener("input", updateCharCount);
+
+$("#copyGreeting").addEventListener("click", async () => {
+  if (!els.greetingText.value.trim() || els.greetingText.value === "正在生成…") return showToast("招呼语尚未生成完成");
+  try { await navigator.clipboard.writeText(els.greetingText.value); showToast("招呼语已复制，可以去沟通啦"); }
+  catch { els.greetingText.select(); document.execCommand("copy"); showToast("招呼语已复制"); }
+});
+
+function updateCharCount() { $("#charCount").textContent = `${els.greetingText.value.length} / 300`; }
+
+async function loadProviderStatus() {
+  try {
+    const response = await fetch("/api/status");
+    const data = await response.json();
+    if (!response.ok) throw new Error("模型状态读取失败");
+    state.providerStatus = data;
+    if (data.extensionPath) $("#extensionPath").value = data.extensionPath;
+    els.providerSelect.replaceChildren(new Option("本地规则 · 隐私优先", "local"));
+    data.providers.forEach(provider => {
+      const option = new Option(`${provider.label} · ${provider.model}${provider.configured ? "" : "（未配置）"}`, provider.id);
+      option.disabled = !provider.configured;
+      els.providerSelect.add(option);
+    });
+    const savedProvider = localStorage.getItem(PROVIDER_STORAGE_KEY);
+    const selectableProviders = [...els.providerSelect.options]
+      .filter(option => !option.disabled)
+      .map(option => option.value);
+    els.providerSelect.value = selectableProviders.includes(savedProvider)
+      ? savedProvider
+      : (data.default || "local");
+    updateProviderHint();
+  } catch {
+    els.providerSelect.value = "local";
+    updateProviderHint();
+  }
+}
+
+function currentProvider() { return els.providerSelect.value || "local"; }
+
+function updateProviderHint() {
+  const isLocal = currentProvider() === "local";
+  $("#modelStatusDot").classList.toggle("local", isLocal);
+  $("#privacyText").textContent = isLocal
+    ? "本地模式不会上传简历；分析与文案均在当前电脑完成。"
+    : "云端模式会把提取后的简历文字发送到所选模型 API，不发送原文件。";
+}
+
+els.providerSelect.addEventListener("change", () => {
+  localStorage.setItem(PROVIDER_STORAGE_KEY, currentProvider());
+  updateProviderHint();
+  if (state.profile) showToast("模型切换将在新分析和下一次文案生成时生效");
+});
+
+function renderRadar() {
+  const radar = state.radar;
+  const visible = radar && radar.status && radar.status !== "idle";
+  els.radarPanel.classList.toggle("hidden", !visible);
+  if (!visible) {
+    els.startRadar.disabled = false;
+    els.startRadar.textContent = "开始自动找工作";
+    els.stopRadar.classList.add("hidden");
+    return;
+  }
+  const completed = Number(radar.completed || 0);
+  const total = Number(radar.total || 0);
+  const progress = total ? Math.min(100, Math.round(completed / total * 100)) : 0;
+  const current = radar.currentTask;
+  const statusText = {
+    running: current ? `正在搜索「${current.query}」` : "正在连续采集岗位",
+    ready: "采集完成，准备统一匹配",
+    paused: "已停止采集，正在整理现有岗位",
+    finalized: "本轮岗位雷达已完成",
+    error: "岗位雷达未能完成整理",
+  }[radar.status] || "正在准备岗位雷达";
+  $("#radarTitle").textContent = statusText;
+  $("#radarDetail").textContent = radar.status === "error"
+    ? (radar.error || "请检查招聘页面或放宽条件后重新开始。")
+    : radar.status === "running"
+    ? `${current?.platformLabel || "招聘平台"} · ${current?.tierLabel || "扩展搜索范围"}`
+    : radar.status === "finalized"
+      ? "岗位已去重并完成统一评分，可按下方分组查看。"
+      : "已采集的岗位会保留，不会因为停止而丢失。";
+  $("#radarProgressText").textContent = `${completed} / ${total}`;
+  $("#radarProgressBar").style.width = `${progress}%`;
+  $("#radarCollected").textContent = Number(radar.collected || 0);
+  $("#radarUnique").textContent = Number(radar.unique || 0);
+  $("#radarDuplicates").textContent = Number(radar.duplicates || 0);
+  $("#radarPlan").innerHTML = (radar.groups || []).map(group => `
+    <div><b>${escapeHtml(group.label)}</b>${group.queries.map(query => `<span>${escapeHtml(query)}</span>`).join("")}</div>
+  `).join("");
+  const running = radar.status === "running";
+  els.startRadar.disabled = running || state.radarFinalizing;
+  els.startRadar.textContent = radar.status === "finalized" ? "开始新一轮搜索" : running ? "岗位雷达运行中" : "重新开始岗位雷达";
+  els.stopRadar.classList.toggle("hidden", !running);
+}
+
+function mergeRadarJobs(incoming) {
+  const hasRealPool = !state.jobSource.includes("示例");
+  const existingJobs = hasRealPool ? state.jobs.map(job => ({ ...job, isNew: false })) : [];
+  const knownKeys = new Set(existingJobs.map(job => `${job.title}|${job.company}|${job.location}`.toLowerCase()));
+  const merged = new Map();
+  existingJobs.forEach(job => merged.set(`${job.title}|${job.company}|${job.location}`.toLowerCase(), job));
+  incoming.forEach(job => {
+    const key = `${job.title}|${job.company}|${job.location}`.toLowerCase();
+    const candidate = { ...job, isNew: !knownKeys.has(key) };
+    const previous = merged.get(key);
+    if (!previous || candidate.score >= previous.score) merged.set(key, { ...candidate, isNew: candidate.isNew });
+  });
+  return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 300);
+}
+
+async function startRadar() {
+  if (!state.profile) return showToast("请先上传并分析简历");
+  if (localStorage.getItem("zhideExtensionOnboarded") !== "1") {
+    state.pendingCapturePlatform = "radar";
+    openExtensionModal();
+    return;
+  }
+  const searchWindow = window.open("about:blank", "_blank");
+  if (!searchWindow) return showToast("浏览器阻止了搜索页，请允许弹出窗口后重试");
+  state.captureSessionId = createSessionId();
+  state.extensionSequence = 0;
+  state.radarFinalizing = false;
+  state.resultView = "all";
+  updateResultTabs();
+  els.startRadar.disabled = true;
+  els.startRadar.textContent = "正在生成搜索计划…";
+  try {
+    const response = await fetchWithTimeout(`/api/radar/start?provider=${encodeURIComponent(currentProvider())}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: state.captureSessionId,
+        profile: profileForRequest(),
+        platforms: ["zhaopin", "boss"]
+      })
+    }, 90000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "岗位雷达启动失败");
+    state.radar = data.radar;
+    renderRadar();
+    saveWorkspace();
+    if (data.firstTask?.url) {
+      searchWindow.opener = null;
+      searchWindow.location.replace(data.firstTask.url);
+    }
+    else searchWindow.close();
+    els.captureStatus.classList.add("hidden");
+    if (data.warning) showToast(data.warning, 5200);
+  } catch (error) {
+    searchWindow.close();
+    state.radar = null;
+    renderRadar();
+    showToast(error.name === "AbortError" ? "生成搜索计划超时，请稍后重试" : error.message);
+  }
+}
+
+async function stopRadar() {
+  if (!state.radar) return;
+  els.stopRadar.disabled = true;
+  try {
+    const response = await fetch("/api/radar/cancel", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.captureSessionId })
+    });
+    const data = await response.json();
+    if (response.ok) state.radar = data.radar;
+    renderRadar();
+    await finalizeRadar();
+  } finally {
+    els.stopRadar.disabled = false;
+  }
+}
+
+async function finalizeRadar() {
+  if (state.radarFinalizing) return;
+  state.radarFinalizing = true;
+  renderRadar();
+  setCaptureStatus("正在统一匹配岗位", "先用本地规则初筛全部岗位，再由大模型精排更值得看的候选。", "working");
+  try {
+    const response = await fetchWithTimeout(`/api/radar/finalize?provider=${encodeURIComponent(currentProvider())}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.captureSessionId, profile: profileForRequest() })
+    }, 180000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "岗位池整理失败");
+    state.jobs = mergeRadarJobs(data.jobs);
+    state.visibleJobs = state.jobs;
+    state.radar = data.radar;
+    state.jobSource = "岗位雷达真实岗位";
+    state.extensionPlatforms = ["智联招聘", "BOSS直聘"];
+    refreshFilterOptions(true);
+    applyEngine(data.engine);
+    updateResultTabs();
+    filterAndRender();
+    renderRadar();
+    updateSourceNotice(data.source);
+    saveWorkspace();
+    els.captureStatus.classList.add("hidden");
+    showToast("岗位雷达已完成，可以先看“重点推荐”");
+  } catch (error) {
+    state.radar = { ...(state.radar || {}), status: "error", error: error.message };
+    renderRadar();
+    saveWorkspace();
+    setCaptureStatus("岗位池整理失败", error.message, "error");
+    showToast(error.name === "AbortError" ? "统一匹配超时，可稍后点击停止并重试整理" : error.message);
+  } finally {
+    state.radarFinalizing = false;
+    renderRadar();
+  }
+}
+
+async function checkRadarStatus() {
+  if (!state.profile || !state.radar || state.radarFinalizing || ["idle", "finalized", "error"].includes(state.radar.status)) return;
+  try {
+    const response = await fetch(`/api/radar/status?session=${encodeURIComponent(state.captureSessionId)}`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok || !data.radar) return;
+    state.radar = data.radar;
+    renderRadar();
+    saveWorkspace();
+    if (state.radar.status === "ready") await finalizeRadar();
+  } catch { /* 本地服务重启后继续等待用户重新开始雷达 */ }
+}
+
+els.startRadar.addEventListener("click", startRadar);
+els.stopRadar.addEventListener("click", stopRadar);
+
+$("#importZhaopin").addEventListener("click", importZhaopinJobs);
+$("#discoverZhaopin").addEventListener("click", () => startExtensionCapture("zhaopin"));
+$("#zhaopinModalClose").addEventListener("click", closeZhaopinModal);
+$("#cancelZhaopinImport").addEventListener("click", closeZhaopinModal);
+els.zhaopinModal.addEventListener("click", event => { if (event.target === els.zhaopinModal) closeZhaopinModal(); });
+$("#confirmZhaopinImport").addEventListener("click", importZhaopinTextJobs);
+$("#openBossImport").addEventListener("click", () => startExtensionCapture("boss"));
+$("#bossModalClose").addEventListener("click", closeBossModal);
+$("#cancelBossImport").addEventListener("click", closeBossModal);
+els.bossModal.addEventListener("click", event => { if (event.target === els.bossModal) closeBossModal(); });
+$("#bossUrl").addEventListener("input", event => {
+  const value = event.target.value.trim();
+  if (value.startsWith("https://") && value.includes("zhipin.com/zhaopin/")) $("#openBossPage").href = value;
+});
+$("#confirmBossImport").addEventListener("click", importBossJobs);
+$("#manualZhaopinText").addEventListener("click", openZhaopinModal);
+$("#manualBossText").addEventListener("click", openBossModal);
+$("#showExtensionGuide").addEventListener("click", openExtensionModal);
+$("#extensionModalClose").addEventListener("click", closeExtensionModal);
+els.extensionModal.addEventListener("click", event => { if (event.target === els.extensionModal) closeExtensionModal(); });
+$("#copyExtensionPath").addEventListener("click", copyExtensionPath);
+$("#extensionInstalled").addEventListener("click", () => {
+  localStorage.setItem("zhideExtensionOnboarded", "1");
+  const platform = state.pendingCapturePlatform;
+  state.pendingCapturePlatform = null;
+  closeExtensionModal();
+  if (platform === "radar") startRadar();
+  else if (platform) activateAndOpenCapture(platform);
+  else showToast("扩展准备完成，打开招聘搜索页就可以一键采集");
+});
+
+function openExtensionModal() {
+  showDialog(els.extensionModal, "#extensionModalClose");
+}
+
+function closeExtensionModal() {
+  state.pendingCapturePlatform = null;
+  hideDialog(els.extensionModal);
+}
+
+async function copyExtensionPath() {
+  const value = $("#extensionPath").value;
+  try { await navigator.clipboard.writeText(value); showToast("扩展目录已复制"); }
+  catch { $("#extensionPath").select(); document.execCommand("copy"); showToast("扩展目录已复制"); }
+}
+
+async function startExtensionCapture(platform) {
+  if (!state.profile) return showToast("请先上传并分析简历");
+  if (!els.jobKeyword.value.trim()) return showToast("请填写岗位关键词");
+  if (localStorage.getItem("zhideExtensionOnboarded") !== "1") {
+    state.pendingCapturePlatform = platform;
+    openExtensionModal();
+    return;
+  }
+  await activateAndOpenCapture(platform);
+}
+
+async function activateAndOpenCapture(platform) {
+  try {
+    const response = await fetchWithTimeout("/api/extension/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.captureSessionId, platform })
+    }, 12000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "无法创建岗位采集会话");
+    state.extensionSequence = data.sequence || 0;
+    openCapturePage(platform);
+  } catch (error) {
+    showToast(error.name === "AbortError" ? "连接本地采集服务超时，请重启应用" : error.message);
+  }
+}
+
+function buildBossSearchUrl() {
+  const cityCodes = {
+    全国: "100010000", 北京: "101010100", 上海: "101020100", 广州: "101280100", 深圳: "101280600",
+    杭州: "101210100", 成都: "101270100", 重庆: "101040100", 武汉: "101200100", 南京: "101190100",
+    苏州: "101190400", 天津: "101030100", 西安: "101110100"
+  };
+  const keyword = els.jobKeyword.value.trim();
+  const city = cityCodes[els.targetCity.value] || cityCodes.全国;
+  return `https://www.zhipin.com/web/geek/job?query=${encodeURIComponent(keyword)}&city=${city}`;
+}
+
+function syncManualBossUrl() {
+  const url = buildBossSearchUrl();
+  $("#bossUrl").value = url;
+  $("#openBossPage").href = url;
+}
+
+function openCapturePage(platform) {
+  const label = platform === "boss" ? "BOSS" : "智联";
+  const url = platform === "boss" ? buildBossSearchUrl() : buildZhaopinSearchUrl();
+  const opened = window.open(url, "_blank");
+  if (!opened) return showToast("浏览器阻止了新页面，请允许弹出窗口后重试");
+  opened.opener = null;
+  setCaptureStatus(`等待 ${label} 岗位`, `已打开定向搜索页；确认条件后点击浏览器工具栏里的“职得岗位采集助手”。`, "waiting");
+  showToast(`已打开 ${label}，加载岗位后点击扩展图标即可`);
+}
+
+function setCaptureStatus(title, detail, mode = "") {
+  $("#captureStatusTitle").textContent = title;
+  $("#captureStatusText").textContent = detail;
+  els.captureStatus.className = `capture-status ${mode}`.trim();
+}
+
+function mergeExtensionJobs(incoming) {
+  const base = state.extensionPlatforms.length ? state.jobs : [];
+  const merged = new Map();
+  [...base, ...incoming].forEach(job => {
+    const key = `${job.title}|${job.company}|${job.location}`.toLowerCase();
+    const existing = merged.get(key);
+    if (!existing || job.score > existing.score) merged.set(key, job);
+  });
+  return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 80);
+}
+
+async function checkExtensionInbox() {
+  if (!state.profile || state.extensionImporting) return;
+  try {
+    const response = await fetch(`/api/extension/latest?session=${encodeURIComponent(state.captureSessionId)}&after=${state.extensionSequence}`, { cache: "no-store" });
+    const data = await response.json();
+    const batches = Array.isArray(data.batches) ? data.batches : (data.batch ? [data.batch] : []);
+    if (!response.ok || !batches.length) return;
+    for (const batch of batches) {
+      if (batch.sessionId && batch.sessionId !== state.captureSessionId) continue;
+      if (batch.radarTaskId) {
+        state.extensionSequence = Math.max(state.extensionSequence, Number(batch.sequence || 0));
+        continue;
+      }
+      await importExtensionBatch(batch);
+      state.extensionSequence = Math.max(state.extensionSequence, Number(batch.sequence || 0));
+    }
+  } catch { /* 服务重新启动时等待下一轮即可 */ }
+}
+
+async function importExtensionBatch(batch) {
+  state.extensionImporting = true;
+  setCaptureStatus(`收到 ${batch.jobs.length} 个${batch.platformLabel}岗位`, "正在去重并根据简历重新计算匹配度…", "working");
+  try {
+    const response = await fetchWithTimeout(`/api/extension/match?provider=${encodeURIComponent(currentProvider())}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platform: batch.platform, url: batch.url, jobs: batch.jobs, profile: profileForRequest() })
+    }, 120000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "扩展岗位匹配失败");
+    state.jobs = mergeExtensionJobs(data.jobs); state.visibleJobs = state.jobs;
+    if (!state.extensionPlatforms.includes(batch.platformLabel)) state.extensionPlatforms.push(batch.platformLabel);
+    state.jobSource = `${state.extensionPlatforms.join(" + ")}扩展岗位`;
+    refreshFilterOptions(true); applyEngine(data.engine); filterAndRender();
+    const excluded = Number(data.source?.excludedCount || 0);
+    const detail = excluded
+      ? `${batch.platformLabel}采集完成，已按求职条件排除 ${excluded} 个岗位；继续采集会自动合并。`
+      : `${batch.platformLabel}采集完成；继续采集其他页面会自动合并和去重。`;
+    setCaptureStatus(`已匹配 ${state.jobs.length} 个真实岗位`, detail, "success");
+    updateSourceNotice(data.source); saveWorkspace();
+    if (!data.engine?.warning) showToast(`${batch.platformLabel}岗位已自动导入并完成匹配`);
+  } catch (error) {
+    setCaptureStatus("岗位接收失败", error.message, "error");
+    showToast(error.message);
+  } finally { state.extensionImporting = false; }
+}
+
+setInterval(() => {
+  checkExtensionInbox();
+  checkRadarStatus();
+}, 2200);
+
+function openBossModal() {
+  if (!state.profile) return showToast("请先上传并分析简历");
+  if (currentProvider() === "local") return showToast("BOSS 文本导入需要大模型，请先选择千问或 DeepSeek");
+  syncManualBossUrl();
+  showDialog(els.bossModal, "#bossPageText");
+}
+
+function closeBossModal() {
+  hideDialog(els.bossModal);
+}
+
+async function importBossJobs() {
+  const pageText = $("#bossPageText").value.trim();
+  const url = $("#bossUrl").value.trim();
+  if (pageText.length < 80) return showToast("请粘贴包含职位、公司和薪资的列表文字");
+  const button = $("#confirmBossImport");
+  button.disabled = true; button.textContent = "正在解析匹配…";
+  try {
+    const response = await fetchWithTimeout(`/api/boss/import?provider=${encodeURIComponent(currentProvider())}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, pageText, profile: profileForRequest() })
+    }, 90000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "BOSS 岗位导入失败");
+    state.jobs = data.jobs; state.visibleJobs = data.jobs; state.jobSource = "BOSS 真实公开岗位"; state.extensionPlatforms = [];
+    refreshFilterOptions(true); applyEngine(data.engine); filterAndRender(); closeBossModal();
+    updateSourceNotice(data.source); saveWorkspace();
+    showToast(`已导入 ${data.jobs.length} 个 BOSS 公开岗位`);
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; button.textContent = "解析并匹配岗位"; }
+}
+
+function buildZhaopinSearchUrl() {
+  const city = els.targetCity.value;
+  const keyword = els.jobKeyword.value.trim();
+  const query = city === "全国" ? keyword : `${city} ${keyword}`;
+  return `https://sou.zhaopin.com/?kw=${encodeURIComponent(query)}&kt=3`;
+}
+
+function openZhaopinModal() {
+  if (!state.profile) return showToast("请先上传并分析简历");
+  if (currentProvider() === "local") return showToast("智联文本导入需要大模型，请先选择千问或 DeepSeek");
+  const keyword = els.jobKeyword.value.trim();
+  if (!keyword) return showToast("请填写岗位关键词，例如“环境工程”");
+  const url = buildZhaopinSearchUrl();
+  $("#zhaopinSearchUrl").value = url; $("#openZhaopinSearch").href = url;
+  showDialog(els.zhaopinModal, "#zhaopinPageText");
+}
+
+function closeZhaopinModal() {
+  hideDialog(els.zhaopinModal);
+}
+
+async function importZhaopinTextJobs() {
+  const pageText = $("#zhaopinPageText").value.trim();
+  const url = $("#zhaopinSearchUrl").value.trim();
+  if (pageText.length < 80) return showToast("请粘贴包含职位、公司、薪资和地点的列表文字");
+  const button = $("#confirmZhaopinImport");
+  button.disabled = true; button.textContent = "正在解析匹配…";
+  try {
+    const response = await fetchWithTimeout(`/api/zhaopin/text-import?provider=${encodeURIComponent(currentProvider())}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, pageText, profile: profileForRequest() })
+    }, 90000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "智联岗位导入失败");
+    const city = els.targetCity.value;
+    state.jobs = data.jobs; state.visibleJobs = data.jobs; state.jobSource = `智联${city === "全国" ? "全国" : city}相关岗位`; state.extensionPlatforms = [];
+    refreshFilterOptions(true); applyEngine(data.engine); filterAndRender(); closeZhaopinModal();
+    updateSourceNotice(data.source); saveWorkspace();
+    showToast(`已导入 ${data.jobs.length} 个相关智联岗位`);
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; button.textContent = "解析并匹配岗位"; }
+}
+
+async function importZhaopinJobs() {
+  if (!state.profile) return showToast("请先上传并分析简历");
+  const button = $("#importZhaopin");
+  const url = $("#zhaopinUrl").value.trim();
+  if (!url) return showToast("请先粘贴智联招聘公开列表页地址");
+  button.disabled = true; button.textContent = "正在读取…";
+  try {
+    const response = await fetchWithTimeout(`/api/zhaopin/import?provider=${encodeURIComponent(currentProvider())}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, profile: profileForRequest() })
+    }, 90000);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "真实岗位导入失败");
+    state.jobs = data.jobs; state.visibleJobs = data.jobs; state.jobSource = "智联真实公开岗位"; state.extensionPlatforms = [];
+    refreshFilterOptions(true); applyEngine(data.engine); filterAndRender();
+    updateSourceNotice(data.source); saveWorkspace();
+    if (!data.engine?.warning) showToast(`已导入 ${data.jobs.length} 个智联公开岗位`);
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; button.textContent = "导入此页面"; }
+}
+
+function applyEngine(engine, showWarning = true) {
+  if (!engine) return;
+  state.engine = engine;
+  const ai = engine.mode === "ai" ? `${engine.label} · ${engine.model}` : "本地规则";
+  const text = `${state.jobSource} · ${ai}`;
+  els.enginePill.innerHTML = `<span class="status-dot ${engine.mode === "local" ? "local" : ""}"></span> ${escapeHtml(text)}`;
+  updateSourceNotice();
+  if (showWarning && engine.warning) showToast(engine.warning, 5200);
+}
+
+function updateSourceNotice(source = null) {
+  if (source) state.sourceMeta = source;
+  const notice = $("#sourceNotice");
+  if (!notice || !state.profile) return;
+  const title = notice.querySelector("b");
+  const detail = notice.querySelector("span");
+  if (state.engine?.warning) {
+    notice.className = "source-notice warning";
+    title.textContent = "部分结果已自动降级";
+    detail.textContent = state.engine.warning;
+    return;
+  }
+  if (state.jobSource.includes("示例")) {
+    notice.className = "source-notice sample";
+    title.textContent = "当前展示示例岗位";
+    detail.textContent = "确认求职条件并完成一次采集后，这里会切换为智联或 BOSS 的真实岗位。";
+    return;
+  }
+  notice.className = "source-notice live";
+  title.textContent = "当前为真实岗位";
+  const excluded = Number(state.sourceMeta?.excludedCount || 0);
+  const sourceName = state.sourceMeta?.name || state.jobSource;
+  if (sourceName === "岗位雷达") {
+    const collected = Number(state.sourceMeta?.collectedCount || 0);
+    const unique = Number(state.sourceMeta?.uniqueCount || state.jobs.length);
+    const duplicates = Number(state.sourceMeta?.duplicateCount || 0);
+    detail.textContent = `跨关键词采集 ${collected} 个，去重后 ${unique} 个${duplicates ? `，合并 ${duplicates} 个重复岗位` : ""}${excluded ? `，按硬性条件排除 ${excluded} 个` : ""}。`;
+    return;
+  }
+  detail.textContent = excluded
+    ? `${sourceName}；已按求职条件排除 ${excluded} 个岗位。`
+    : `${sourceName}；打开职位标题可回到原招聘页面核对详情。`;
+}
+
+function showToast(message, duration = 3200) {
+  els.toast.textContent = message; els.toast.classList.add("show");
+  clearTimeout(showToast.timer); showToast.timer = setTimeout(() => els.toast.classList.remove("show"), duration);
+}
+
+async function fetchWithTimeout(url, options = {}, timeout = 75000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
+}

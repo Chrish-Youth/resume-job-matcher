@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>职得岗位采集助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header><span>职</span><div><h1>职得岗位采集助手</h1><p>岗位雷达连续采集 / 当前页手动导入</p></div></header>
+    <div class="status" id="status"><i></i><span>从本地助手启动岗位雷达后会自动运行</span></div>
+    <label class="switch"><input id="autoScroll" type="checkbox" checked><i></i><span><b>自动加载本页更多岗位</b><small>采集前向下滚动几屏，不会自动投递</small></span></label>
+    <button class="primary" id="collect" type="button">手动采集当前页</button>
+    <button class="secondary" id="openApp" type="button">打开本地匹配助手</button>
+    <p class="privacy">只读取当前页面可见的公开职位卡片，不读取账号、Cookie、聊天或简历。</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

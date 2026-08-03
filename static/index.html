@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="上传简历，智能匹配岗位并生成招聘平台招呼语。">
+  <title>职得 · 简历岗位匹配助手</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="topbar-action hidden" id="clearWorkspace" type="button">清空本机记录</button>
+    <label class="model-control" title="选择用于简历分析和文案生成的引擎">
+      <span class="status-dot" id="modelStatusDot"></span>
+      <span>智能引擎</span>
+      <select id="providerSelect" aria-label="智能引擎">
+        <option value="local">本地规则</option>
+      </select>
+    </label>
+  </header>
+
+  <main>
+    <section class="hero" id="hero">
+      <div class="eyebrow">简历匹配与求职沟通助手</div>
+      <h1>一次确认，自动扩展你的岗位选择</h1>
+      <p>上传简历后自动规划精准、相邻和可迁移岗位，连续采集智联招聘与 BOSS 直聘，再统一筛选真正值得看的机会。</p>
+      <div class="steps" aria-label="使用步骤">
+        <div class="step active"><b>上传简历</b></div>
+        <i></i>
+        <div class="step"><b>自动搜索</b></div>
+        <i></i>
+        <div class="step"><b>查看推荐并沟通</b></div>
+      </div>
+    </section>
+
+    <section class="upload-shell" id="uploadSection">
+      <div class="upload-card" id="dropZone">
+        <input id="fileInput" type="file" accept=".docx,.pdf,.txt" hidden>
+        <div class="upload-icon">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 002 2h10a2 2 0 002-2v-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <h2>把简历拖到这里</h2>
+        <p>或点击选择你的简历文件</p>
+        <div class="upload-actions">
+          <button class="primary-button" id="chooseFile" type="button">选择简历</button>
+          <button class="demo-button" id="tryDemo" type="button">先看示例</button>
+        </div>
+        <small>支持 DOCX、PDF、TXT · 最大 8MB</small>
+      </div>
+      <div class="privacy-strip">
+        <span>⌁</span>
+        <div><b>数据范围透明</b><p id="privacyText">本地模式不会上传；选择云端模型后，简历文字会发送到对应模型 API。</p></div>
+      </div>
+    </section>
+
+    <section class="loading-panel hidden" id="loadingPanel" aria-live="polite">
+      <div class="loader-orbit"><span></span></div>
+      <h2>正在读懂你的简历</h2>
+      <p id="loadingText">提取教育与经历信息…</p>
+      <div class="loading-bar"><i></i></div>
+    </section>
+
+    <section class="workspace hidden" id="workspace">
+      <aside class="profile-card">
+        <div class="profile-topline"><span>简历画像</span><button id="replaceFile" type="button">重新上传</button></div>
+        <div class="person">
+          <div class="avatar" id="avatar">求</div>
+          <div><h2 id="profileName">求职者</h2><p id="profileTarget">运营方向</p></div>
+        </div>
+        <div class="file-chip"><span id="fileType">DOC</span><div><b id="profileFile">resume.docx</b><small>已完成解析</small></div><i>✓</i></div>
+        <div class="profile-grid">
+          <div><small>最高学历</small><b id="profileEducation">本科</b></div>
+          <div><small>经历模块</small><b><span id="experienceCount">2</span> 段</b></div>
+        </div>
+        <div class="profile-section">
+          <h3>识别到的技能 <span id="skillCount">0</span></h3>
+          <div class="skill-list" id="skillList"></div>
+        </div>
+        <div class="profile-tip"><span>✦</span><p id="profileTip">已根据简历信息完成岗位匹配。</p></div>
+      </aside>
+
+      <div class="results">
+        <div class="results-header">
+          <div><p>为你找到</p><h2><span id="jobCount">0</span> 个匹配岗位</h2></div>
+          <div class="source-pill" id="enginePill"><span class="status-dot"></span> 本地规则 · 示例岗位</div>
+        </div>
+        <div class="source-notice sample" id="sourceNotice" role="status">
+          <b>当前展示示例岗位</b>
+          <span>确认下面的求职条件并采集后，这里会切换为智联或 BOSS 的真实岗位。</span>
+        </div>
+        <div class="live-source">
+          <div class="live-source-head">
+            <div><b>岗位雷达</b><small>确认基本条件后，系统会自动扩展关键词并连续采集多个搜索结果页。</small></div>
+            <button class="text-button" id="showExtensionGuide" type="button">采集扩展说明</button>
+          </div>
+          <div class="preference-grid">
+            <label><span>目标城市</span><select id="targetCity">
+              <option value="全国">全国</option><option value="北京">北京</option><option value="上海">上海</option>
+              <option value="广州">广州</option><option value="深圳">深圳</option><option value="杭州">杭州</option>
+              <option value="成都">成都</option><option value="重庆">重庆</option><option value="武汉">武汉</option>
+              <option value="南京">南京</option><option value="苏州">苏州</option><option value="天津">天津</option><option value="西安">西安</option>
+            </select></label>
+            <label><span>岗位关键词</span><input id="jobKeyword" placeholder="例如：环境工程"></label>
+            <label><span>最低月薪</span><select id="minSalaryPreference">
+              <option value="0">不限</option><option value="3">3K 以上</option><option value="5">5K 以上</option>
+              <option value="8">8K 以上</option><option value="10">10K 以上</option><option value="15">15K 以上</option>
+            </select></label>
+            <label class="fresh-filter quick-filter"><input id="freshFilter" type="checkbox"><i></i><span>只看实习 / 应届</span></label>
+          </div>
+          <div class="radar-actions">
+            <button class="radar-start-button" id="startRadar" type="button">开始自动找工作</button>
+            <button class="secondary-button hidden" id="stopRadar" type="button">停止并整理当前岗位</button>
+          </div>
+        </div>
+        <section class="radar-panel hidden" id="radarPanel" aria-live="polite">
+          <div class="radar-progress-head">
+            <div><b id="radarTitle">正在规划搜索范围</b><small id="radarDetail">根据简历生成职位关键词…</small></div>
+            <strong id="radarProgressText">0 / 0</strong>
+          </div>
+          <div class="radar-progress"><i id="radarProgressBar"></i></div>
+          <div class="radar-stats">
+            <span><b id="radarCollected">0</b> 采集</span>
+            <span><b id="radarUnique">0</b> 去重后</span>
+            <span><b id="radarDuplicates">0</b> 重复</span>
+          </div>
+          <div class="radar-plan" id="radarPlan"></div>
+        </section>
+        <div class="capture-status hidden" id="captureStatus">
+          <span class="capture-dot"></span>
+          <div><b id="captureStatusTitle">等待采集</b><small id="captureStatusText">打开招聘页后，点击浏览器工具栏中的岗位采集扩展。</small></div>
+        </div>
+        <details class="manual-source">
+          <summary>单页采集与手动导入</summary>
+          <div class="single-capture-actions">
+            <button class="zhaopin-button" id="discoverZhaopin" type="button">只采集当前智联搜索</button>
+            <button class="boss-button" id="openBossImport" type="button">只采集当前 BOSS 搜索</button>
+          </div>
+          <div class="manual-actions">
+            <button id="manualZhaopinText" type="button">粘贴智联职位文字</button>
+            <button id="manualBossText" type="button">粘贴 BOSS 职位文字</button>
+          </div>
+          <div><label class="live-url"><input id="zhaopinUrl" placeholder="https://www.zhaopin.com/zhaopin/…/" aria-label="智联招聘公开职位列表页"></label><button id="importZhaopin" type="button">导入智联公开页</button></div>
+        </details>
+        <details class="filter-panel">
+          <summary><span>筛选当前结果 <b id="activeFilterCount" class="hidden">0</b></span><span>展开</span></summary>
+          <div class="filter-grid">
+            <label><span>工作地点</span><select id="locationFilter"><option value="all">全部地点</option></select></label>
+            <label><span>学历要求</span><select id="educationFilter"><option value="all">全部学历</option></select></label>
+            <label><span>经验要求</span><select id="experienceFilter"><option value="all">全部经验</option></select></label>
+            <button id="resetFilters" type="button">重置结果筛选</button>
+          </div>
+        </details>
+        <div class="toolbar">
+          <label class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M16 16l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            <input id="searchInput" placeholder="搜索职位或公司" aria-label="搜索职位或公司">
+          </label>
+          <select id="sortSelect" aria-label="结果排序"><option value="score">推荐优先</option><option value="latest">最近采集</option></select>
+        </div>
+        <div class="result-tabs" id="resultTabs" aria-label="岗位分组">
+          <button class="active" data-view="all" type="button">全部 <span id="allJobCount">0</span></button>
+          <button data-view="strong" type="button">重点推荐 <span id="strongJobCount">0</span></button>
+          <button data-view="transferable" type="button">可迁移 <span id="transferJobCount">0</span></button>
+          <button data-view="new" type="button">本轮新增 <span id="newJobCount">0</span></button>
+        </div>
+        <div class="job-list" id="jobList"></div>
+        <div class="empty-state hidden" id="emptyState"><span>⌕</span><h3>没找到对应岗位</h3><p id="emptyHint">换个职位或公司关键词试试。</p></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status"></div>
+
+  <div class="modal-backdrop hidden" id="extensionModal" role="dialog" aria-modal="true" aria-labelledby="extensionModalTitle">
+    <div class="modal extension-modal">
+      <button class="modal-close" id="extensionModalClose" type="button" aria-label="关闭扩展说明">×</button>
+      <div class="modal-kicker extension-kicker">Edge / Chrome · 首次安装一次</div>
+      <h2 id="extensionModalTitle">安装或更新岗位采集扩展</h2>
+      <p class="modal-subtitle">岗位雷达依靠扩展自动切换搜索词并回传岗位。以前安装过时，请在扩展管理页点击一次“重新加载”。</p>
+      <ol class="extension-steps">
+        <li><b>打开扩展管理页</b><span>Edge 输入 edge://extensions，Chrome 输入 chrome://extensions</span></li>
+        <li><b>开启“开发人员模式”</b><span>首次安装选择“加载解压缩的扩展”；已有扩展点击“重新加载”</span></li>
+        <li><b>选择下面的扩展目录</b><span>启动岗位雷达后无需再逐页点击扩展图标</span></li>
+      </ol>
+      <label class="extension-path"><span>扩展目录</span><input id="extensionPath" readonly value="extension"></label>
+      <div class="modal-actions">
+        <button class="secondary-button" id="copyExtensionPath" type="button">复制扩展目录</button>
+        <button class="primary-button" id="extensionInstalled" type="button">我已更新，开始使用</button>
+      </div>
+      <p class="boss-privacy">扩展只读取当前网页可见的公开职位卡片，不读取账号、Cookie、聊天记录，也不会自动投递。</p>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="zhaopinModal" role="dialog" aria-modal="true" aria-labelledby="zhaopinModalTitle">
+    <div class="modal boss-modal">
+      <button class="modal-close" id="zhaopinModalClose" type="button" aria-label="关闭智联导入">×</button>
+      <div class="modal-kicker zhaopin-kicker">智联招聘 · 定向导入</div>
+      <h2 id="zhaopinModalTitle">按城市和方向导入岗位</h2>
+      <p class="modal-subtitle">已根据上方的城市和关键词生成搜索页。请打开页面、确认城市条件，复制职位列表文字后粘贴。</p>
+      <div class="boss-steps zhaopin-steps">
+        <span><b>1</b>打开定向搜索页</span><i>→</i><span><b>2</b>确认城市并复制岗位</span><i>→</i><span><b>3</b>粘贴并智能匹配</span>
+      </div>
+      <label class="boss-field"><span>智联搜索页</span><input id="zhaopinSearchUrl" readonly></label>
+      <a class="open-boss-link zhaopin-link" id="openZhaopinSearch" href="#" target="_blank" rel="noopener">打开智联定向搜索页 ↗</a>
+      <label class="boss-field"><span>粘贴职位列表文字</span><textarea id="zhaopinPageText" rows="9" placeholder="在智联页面中复制包含职位、公司、薪资和地点的列表区域…"></textarea></label>
+      <p class="boss-privacy">职位文字和当前简历画像会发送给右上角所选模型，用于结构化和人岗匹配。</p>
+      <div class="modal-actions">
+        <button class="secondary-button" id="cancelZhaopinImport" type="button">取消</button>
+        <button class="primary-button zhaopin-confirm" id="confirmZhaopinImport" type="button">解析并匹配岗位</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="bossModal" role="dialog" aria-modal="true" aria-labelledby="bossModalTitle">
+    <div class="modal boss-modal">
+      <button class="modal-close" id="bossModalClose" type="button" aria-label="关闭 BOSS 导入">×</button>
+      <div class="modal-kicker">BOSS 直聘 · 安全导入</div>
+      <h2 id="bossModalTitle">从 BOSS 导入真实岗位</h2>
+      <p class="modal-subtitle">BOSS 会对程序访问显示安全校验页，因此由你在浏览器中复制公开职位列表，再交给大模型结构化。</p>
+      <div class="boss-steps">
+        <span><b>1</b>打开公开招聘页</span><i>→</i><span><b>2</b>复制职位列表文字</span><i>→</i><span><b>3</b>粘贴并匹配</span>
+      </div>
+      <label class="boss-field"><span>公开招聘页</span><input id="bossUrl" placeholder="根据上方城市和关键词自动生成"></label>
+      <a class="open-boss-link" id="openBossPage" href="#" target="_blank" rel="noopener">打开当前条件的 BOSS 搜索页 ↗</a>
+      <label class="boss-field"><span>粘贴职位列表文字</span><textarea id="bossPageText" rows="9" placeholder="在 BOSS 页面中选中职位列表区域，复制后粘贴到这里…"></textarea></label>
+      <p class="boss-privacy">粘贴的职位文字和当前简历画像会发送给右上角所选模型；不会发送 BOSS 登录信息或 Cookie。</p>
+      <div class="modal-actions">
+        <button class="secondary-button" id="cancelBossImport" type="button">取消</button>
+        <button class="primary-button boss-confirm" id="confirmBossImport" type="button">解析并匹配岗位</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="greetingModal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal">
+      <button class="modal-close" id="modalClose" type="button" aria-label="关闭">×</button>
+      <div class="modal-kicker">专属开场白</div>
+      <h2 id="modalTitle">向招聘者打个招呼</h2>
+      <p class="modal-subtitle" id="modalJob">根据你与岗位的匹配点智能生成</p>
+      <div class="tone-tabs" id="toneTabs">
+        <button class="active" data-tone="professional">专业得体</button>
+        <button data-tone="direct">简洁直接</button>
+        <button data-tone="warm">亲切自然</button>
+      </div>
+      <div class="greeting-editor">
+        <textarea id="greetingText" rows="7" maxlength="300"></textarea>
+        <span id="charCount">0 / 300</span>
+      </div>
+      <div class="match-basis" id="matchBasis"></div>
+      <div class="modal-actions">
+        <button class="secondary-button" id="regenerate" type="button">↻ 换一种表达</button>
+        <button class="primary-button copy-button" id="copyGreeting" type="button">复制招呼语</button>
+      </div>
+      <p class="platform-note" id="platformNote">可粘贴到招聘平台的沟通对话框中</p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
