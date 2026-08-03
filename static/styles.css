@@ -673,6 +673,70 @@ main { padding: 20px 24px 72px; }
   border-radius: var(--radius-sm);
 }
 
+.schedule-panel {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.schedule-panel summary {
+  min-height: 44px;
+  padding: 0 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+}
+.schedule-controls {
+  padding: 0 13px 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.schedule-controls > label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.schedule-controls input[type="time"] {
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--surface);
+}
+.schedule-controls input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--green); }
+.schedule-hint { margin: 0 13px 13px; color: var(--subtle); font-size: 12px; line-height: 1.6; }
+.scheduled-result {
+  margin-bottom: 10px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--green);
+  border-radius: var(--radius-md);
+  background: var(--green-soft);
+}
+.scheduled-result b { color: var(--ink); font-size: 13px; }
+.scheduled-result span { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; }
+.scheduled-result button {
+  min-height: 34px;
+  padding: 0 12px;
+  flex: 0 0 auto;
+  border: 1px solid var(--green);
+  border-radius: var(--radius-sm);
+  color: white;
+  background: var(--green);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .filter-panel {
   margin-bottom: 10px;
   border: 1px solid var(--line);

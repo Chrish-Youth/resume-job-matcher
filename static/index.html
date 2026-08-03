@@ -127,6 +127,20 @@
           </div>
           <div class="radar-plan" id="radarPlan"></div>
         </section>
+        <details class="schedule-panel">
+          <summary><span>定时雷达</span><span id="scheduleState">未开启</span></summary>
+          <div class="schedule-controls">
+            <label><span>每日运行时间</span><input type="time" id="scheduleTime" value="09:00"></label>
+            <label class="schedule-toggle"><input id="scheduleEnabled" type="checkbox"><span>每天自动跑一轮，发现新岗位会通知</span></label>
+            <button class="secondary-button" id="saveSchedule" type="button">保存定时设置</button>
+          </div>
+          <p class="schedule-hint">开启后，只要浏览器在你设定的时间处于运行状态，就会自动采集并匹配新岗位；完成后扩展会发桌面通知。</p>
+        </details>
+        <div class="scheduled-result hidden" id="scheduledResult" role="status">
+          <b id="scheduledResultTitle">定时雷达有新结果</b>
+          <span id="scheduledResultText"></span>
+          <button id="loadScheduledResults" type="button">载入结果</button>
+        </div>
         <div class="capture-status hidden" id="captureStatus">
           <span class="capture-dot"></span>
           <div><b id="captureStatusTitle">等待采集</b><small id="captureStatusText">打开招聘页后，点击浏览器工具栏中的岗位采集扩展。</small></div>

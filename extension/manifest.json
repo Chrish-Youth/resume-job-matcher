@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "职得岗位采集助手",
-  "version": "1.1.0",
-  "description": "按岗位雷达计划连续采集智联招聘和 BOSS 直聘公开职位，并发送到本地简历匹配助手。",
-  "permissions": ["activeTab", "tabs"],
+  "version": "1.2.0",
+  "description": "按岗位雷达计划连续采集智联招聘和 BOSS 直聘公开职位，支持定时自动运行并通知新岗位。",
+  "permissions": ["activeTab", "tabs", "alarms", "notifications", "storage"],
   "host_permissions": [
     "http://127.0.0.1:8765/*",
     "https://*.zhaopin.com/*",
@@ -11,6 +11,12 @@
     "https://*.zhipin.com/*",
     "https://zhipin.com/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "128": "icons/icon128.png"
+  },
   "action": {
     "default_title": "采集当前页岗位",
     "default_popup": "popup.html"

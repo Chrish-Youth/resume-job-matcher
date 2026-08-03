@@ -1,5 +1,7 @@
 import json
 import re
+import shutil
+import tempfile
 import unittest
 import urllib.error
 from io import BytesIO
@@ -7,6 +9,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app
+
+_test_store_dir = app.ROOT / "tmp" / "zhide-test-store"
+_test_store_dir.mkdir(parents=True, exist_ok=True)
+app.DATA_DIR = _test_store_dir
+app.RADAR_STORE_PATH = _test_store_dir / "radar_store.json"
+app._load_radar_store()
+
+
+def tearDownModule():
+    shutil.rmtree(_test_store_dir, ignore_errors=True)
 
 
 def make_job(index: int, **overrides):
@@ -315,6 +327,101 @@ class GreetingTests(unittest.TestCase):
             greeting = app.generate_greeting(self.profile, job, tone)
             self.assertIn("环境工程师", greeting)
             self.assertLessEqual(len(greeting), 300)
+
+
+class ScheduledRadarTests(unittest.TestCase):
+    def setUp(self):
+        with app.EXTENSION_INBOX_LOCK:
+            app.EXTENSION_SESSIONS.clear()
+            app.ACTIVE_EXTENSION_SESSION = None
+            self._old_schedule = dict(app.SCHEDULE_CONFIG)
+            self._old_last = dict(app.LAST_SCHEDULED)
+            app.LAST_SCHEDULED.clear()
+            app.LAST_SCHEDULED.update({
+                "profile": None, "jobs": [], "ids": [], "engine": None, "summary": None,
+            })
+
+    def tearDown(self):
+        with app.EXTENSION_INBOX_LOCK:
+            app.EXTENSION_SESSIONS.clear()
+            app.ACTIVE_EXTENSION_SESSION = None
+            app.SCHEDULE_CONFIG.clear()
+            app.SCHEDULE_CONFIG.update(self._old_schedule)
+            app.LAST_SCHEDULED.clear()
+            app.LAST_SCHEDULED.update(self._old_last)
+
+    def _enable_schedule(self):
+        with app.EXTENSION_INBOX_LOCK:
+            app.SCHEDULE_CONFIG.update({
+                "enabled": True,
+                "hour": 9,
+                "minute": 0,
+                "platforms": ["zhaopin", "boss"],
+                "profile": {
+                    "city": "上海",
+                    "searchKeyword": "环境工程",
+                    "skills": ["环境监测"],
+                },
+                "provider": None,
+            })
+
+    def test_scheduled_start_creates_auto_finalize_session(self):
+        self._enable_schedule()
+        session_id, radar = app.start_scheduled_radar()
+        self.assertTrue(session_id.startswith("sched_"))
+        self.assertEqual(radar["status"], "running")
+        self.assertTrue(radar["currentTask"]["url"])
+        with app.EXTENSION_INBOX_LOCK:
+            session = app.EXTENSION_SESSIONS[session_id]
+            self.assertIs(session.get("autoFinalize"), True)
+            self.assertEqual(session["profile"]["city"], "上海")
+
+    def test_scheduled_start_refuses_without_enabled_schedule(self):
+        with self.assertRaises(ValueError):
+            app.start_scheduled_radar()
+
+    def test_scheduled_start_refuses_when_radar_running(self):
+        self._enable_schedule()
+        app.start_scheduled_radar()
+        with self.assertRaises(ValueError):
+            app.start_scheduled_radar()
+
+    def test_auto_finalize_marks_finalized_and_records_summary(self):
+        self._enable_schedule()
+        session_id, radar = app.start_scheduled_radar()
+        job = make_job(1, id="sched-job-1")
+        app.radar_record_batch(session_id, radar["currentTask"]["id"], {"jobs": [job]})
+        with app.EXTENSION_INBOX_LOCK:
+            app.EXTENSION_SESSIONS[session_id]["radar"]["status"] = "ready"
+
+        def fake_finalize(_profile, jobs, _provider):
+            return [{**item, "score": 88, "fitGrade": "A", "matchEngine": "ai"} for item in jobs], 0, None
+
+        with patch.object(app, "finalize_radar_jobs", side_effect=fake_finalize):
+            app._auto_finalize_scheduled_worker(session_id)
+
+        with app.EXTENSION_INBOX_LOCK:
+            session = app.EXTENSION_SESSIONS[session_id]
+            self.assertEqual(session["radar"]["status"], "finalized")
+            self.assertEqual(len(session["finalizedJobs"]), 1)
+        self.assertEqual(app.LAST_SCHEDULED["summary"]["newCount"], 1)
+        self.assertEqual(app.LAST_SCHEDULED["ids"], ["sched-job-1"])
+
+    def test_store_roundtrip_preserves_schedule_and_session(self):
+        self._enable_schedule()
+        session_id, _radar = app.start_scheduled_radar()
+        app._save_radar_store()
+
+        with app.EXTENSION_INBOX_LOCK:
+            app.EXTENSION_SESSIONS.clear()
+            app.ACTIVE_EXTENSION_SESSION = None
+            app.SCHEDULE_CONFIG.update({"enabled": False, "profile": None})
+        app._load_radar_store()
+
+        with app.EXTENSION_INBOX_LOCK:
+            self.assertIn(session_id, app.EXTENSION_SESSIONS)
+            self.assertTrue(app.SCHEDULE_CONFIG["enabled"])
+            self.assertEqual(app.SCHEDULE_CONFIG["profile"]["city"], "上海")
 
 
 class ZhaopinParserTests(unittest.TestCase):

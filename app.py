@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,66 @@ DEFAULT_ZHAOPIN_PAGE = "https://www.zhaopin.com/zhaopin/d3cf28136d2549c28f3e4080
 DEFAULT_BOSS_PAGE = "https://www.zhipin.com/zhaopin/a039b5c4a0e354941Hd729u1Eg~~/"
 LOCAL_HOST_NAMES = {"127.0.0.1", "localhost", "[::1]"}
 ALLOWED_HOST_HEADERS = {name for name in LOCAL_HOST_NAMES} | {f"{name}:8765" for name in LOCAL_HOST_NAMES}
+DATA_DIR = ROOT / "data"
+RADAR_STORE_PATH = DATA_DIR / "radar_store.json"
+SCHEDULE_CONFIG: dict = {
+    "enabled": False,
+    "hour": 9,
+    "minute": 0,
+    "platforms": ["zhaopin", "boss"],
+    "profile": None,
+    "provider": None,
+    "updatedAt": 0,
+}
+LAST_SCHEDULED: dict = {
+    "profile": None,
+    "jobs": [],
+    "ids": [],
+    "engine": None,
+    "summary": None,
+}
+
+
+def _load_radar_store() -> None:
+    try:
+        payload = json.loads(RADAR_STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    sessions = payload.get("sessions")
+    if isinstance(sessions, dict):
+        EXTENSION_SESSIONS.clear()
+        EXTENSION_SESSIONS.update({
+            key: value for key, value in sessions.items() if isinstance(value, dict)
+        })
+    global ACTIVE_EXTENSION_SESSION
+    active = payload.get("activeSession")
+    if isinstance(active, str):
+        ACTIVE_EXTENSION_SESSION = active
+    schedule = payload.get("schedule")
+    if isinstance(schedule, dict):
+        SCHEDULE_CONFIG.update(schedule)
+    last = payload.get("lastScheduled")
+    if isinstance(last, dict):
+        LAST_SCHEDULED.update(last)
+
+
+def _save_radar_store() -> None:
+    payload = {
+        "activeSession": ACTIVE_EXTENSION_SESSION,
+        "schedule": SCHEDULE_CONFIG,
+        "sessions": EXTENSION_SESSIONS,
+        "lastScheduled": LAST_SCHEDULED,
+    }
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        temp_path = RADAR_STORE_PATH.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(RADAR_STORE_PATH)
+    except OSError as exc:
+        print(f"雷达数据持久化失败：{exc}", file=sys.stderr)
+
+
+_load_radar_store()
 BOSS_CITY_CODES = {
     "全国": "100010000", "北京": "101010100", "上海": "101020100", "广州": "101280100",
     "深圳": "101280600", "杭州": "101210100", "成都": "101270100", "重庆": "101040100",
@@ -1578,6 +1639,8 @@ def cleanup_extension_sessions(now: float | None = None) -> None:
     ]
     for session_id in expired:
         EXTENSION_SESSIONS.pop(session_id, None)
+    if expired:
+        _save_radar_store()
 
 
 def activate_extension_session(session_id: str, platform: str = "") -> dict:
@@ -1592,6 +1655,7 @@ def activate_extension_session(session_id: str, platform: str = "") -> dict:
         session["updatedAt"] = now
         session["platform"] = platform[:30]
         ACTIVE_EXTENSION_SESSION = session_id
+        _save_radar_store()
         return {"sessionId": session_id, "sequence": int(session["sequence"])}
 
 
@@ -1615,6 +1679,7 @@ def enqueue_extension_batch(batch: dict) -> tuple[str, int]:
         del batches[:-20]
         session["sequence"] = sequence
         session["updatedAt"] = now
+        _save_radar_store()
         return session_id, sequence
 
 
@@ -1678,6 +1743,7 @@ def start_radar_session(session_id: str, plan: dict) -> dict:
             "startedAt": int(now),
         }
         session["updatedAt"] = now
+        _save_radar_store()
         return radar_public_state(session["radar"])
 
 
@@ -1752,6 +1818,9 @@ def radar_record_batch(session_id: str, task_id: str, batch: dict) -> dict:
         if radar["cursor"] >= len(tasks):
             radar["status"] = "ready"
         session["updatedAt"] = now
+        _save_radar_store()
+        if session.get("autoFinalize") is True and radar["status"] == "ready":
+            maybe_auto_finalize_scheduled(session_id)
         return radar_public_state(radar)
 
 
@@ -1762,6 +1831,7 @@ def cancel_radar_session(session_id: str) -> dict:
         if isinstance(radar, dict) and radar.get("status") == "running":
             radar["status"] = "paused"
             session["updatedAt"] = time.time()
+            _save_radar_store()
         return radar_public_state(radar)
 
 
@@ -1784,6 +1854,7 @@ def block_radar_task(session_id: str, task_id: str, reason: str) -> dict:
             radar["blockedReason"] = str(reason or "招聘页面需要人工处理")[:200]
             radar["blockedAt"] = int(time.time())
             session["updatedAt"] = time.time()
+            _save_radar_store()
         return radar_public_state(radar)
 
 
@@ -1800,6 +1871,7 @@ def resume_radar_session(session_id: str) -> dict:
             if isinstance(tasks, list) and 0 <= cursor < len(tasks):
                 tasks[cursor]["status"] = "pending"
             session["updatedAt"] = time.time()
+            _save_radar_store()
         return radar_public_state(radar)
 
 
@@ -1811,6 +1883,7 @@ def mark_radar_finalized(session_id: str) -> dict:
             radar["status"] = "finalized"
             radar["finalizedAt"] = int(time.time())
             session["updatedAt"] = time.time()
+            _save_radar_store()
         return radar_public_state(radar)
 
 
@@ -1850,6 +1923,102 @@ def finalize_radar_jobs(
     except ValueError as exc:
         warning = f"岗位已全部完成本地初筛；大模型精排暂时不可用：{exc}"
         return local_ranked[:300], excluded_count, warning
+
+
+def public_schedule() -> dict:
+    return {
+        "enabled": bool(SCHEDULE_CONFIG.get("enabled")),
+        "hour": int(SCHEDULE_CONFIG.get("hour", 9)),
+        "minute": int(SCHEDULE_CONFIG.get("minute", 0)),
+        "platforms": [str(item) for item in SCHEDULE_CONFIG.get("platforms", ["zhaopin", "boss"])],
+        "updatedAt": SCHEDULE_CONFIG.get("updatedAt", 0),
+    }
+
+
+def start_scheduled_radar() -> tuple[str, dict]:
+    with EXTENSION_INBOX_LOCK:
+        schedule = SCHEDULE_CONFIG
+        profile = schedule.get("profile")
+        if not schedule.get("enabled") or not isinstance(profile, dict):
+            raise ValueError("尚未设置定时雷达或缺少简历画像。")
+        if ACTIVE_EXTENSION_SESSION:
+            active = EXTENSION_SESSIONS.get(ACTIVE_EXTENSION_SESSION)
+            if isinstance(active, dict) and isinstance(active.get("radar"), dict) and active["radar"].get("status") == "running":
+                raise ValueError("已有正在运行的岗位雷达，稍后再试。")
+        platforms = [
+            str(item) for item in schedule.get("platforms", ["zhaopin", "boss"])
+            if str(item) in {"zhaopin", "boss"}
+        ]
+        if not platforms:
+            platforms = ["zhaopin", "boss"]
+    plan = generate_search_plan(profile, schedule.get("provider"), platforms)
+    if not plan.get("tasks"):
+        raise ValueError("没有生成有效的搜索计划。")
+    session_id = f"sched_{secrets.token_hex(8)}"
+    radar = start_radar_session(session_id, plan)
+    with EXTENSION_INBOX_LOCK:
+        session = EXTENSION_SESSIONS[session_id]
+        session["profile"] = profile
+        session["provider"] = schedule.get("provider")
+        session["autoFinalize"] = True
+        _save_radar_store()
+    return session_id, radar
+
+
+def maybe_auto_finalize_scheduled(session_id: str) -> None:
+    threading.Thread(
+        target=_auto_finalize_scheduled_worker,
+        args=(session_id,),
+        daemon=True,
+    ).start()
+
+
+def _auto_finalize_scheduled_worker(session_id: str) -> None:
+    try:
+        time.sleep(1)
+        with EXTENSION_INBOX_LOCK:
+            session = EXTENSION_SESSIONS.get(session_id)
+            if not session or session.get("autoFinalize") is not True:
+                return
+            radar = session.get("radar")
+            if not isinstance(radar, dict) or radar.get("status") != "ready":
+                return
+            profile = session.get("profile")
+            provider_id = session.get("provider")
+            if not isinstance(profile, dict):
+                return
+        jobs, radar_state = radar_job_pool(session_id)
+        if not jobs:
+            return
+        ranked, excluded_count, warning = finalize_radar_jobs(profile, jobs, provider_id)
+        previous_ids = set(LAST_SCHEDULED.get("ids", []))
+        current_ids = [str(job["id"]) for job in ranked if job.get("id")]
+        new_ids = [job_id for job_id in current_ids if job_id not in previous_ids]
+        summary = {
+            "runId": f"{session_id}-{int(time.time())}",
+            "finishedAt": int(time.time()),
+            "newCount": len(new_ids),
+            "totalCount": len(ranked),
+            "message": f"发现 {len(new_ids)} 个新岗位，共整理出 {len(ranked)} 个匹配岗位。",
+        }
+        with EXTENSION_INBOX_LOCK:
+            session = EXTENSION_SESSIONS.get(session_id)
+            if session:
+                session["finalizedJobs"] = ranked
+                session["excludedCount"] = excluded_count
+                radar = session.get("radar")
+                if isinstance(radar, dict):
+                    radar["status"] = "finalized"
+                    radar["finalizedAt"] = int(time.time())
+                    radar["warning"] = warning
+            LAST_SCHEDULED["profile"] = profile
+            LAST_SCHEDULED["jobs"] = ranked
+            LAST_SCHEDULED["ids"] = current_ids
+            LAST_SCHEDULED["engine"] = engine_info(provider_id, warning)
+            LAST_SCHEDULED["summary"] = summary
+            _save_radar_store()
+    except Exception as exc:
+        print(f"定时雷达自动整理失败：{exc}", file=sys.stderr)
 
 
 def parse_multipart(content_type: str, body: bytes) -> tuple[str, bytes]:
@@ -1946,6 +2115,29 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             self.send_json({"sessionId": session_id, "radar": radar_state(session_id)})
             return
+        if path == "/api/radar/schedule":
+            if not self.extension_origin_allowed():
+                self.send_json({"error": "只接受本机助手读取定时设置。"}, HTTPStatus.FORBIDDEN)
+                return
+            self.send_json(public_schedule())
+            return
+        if path == "/api/radar/scheduled/last":
+            if not self.extension_origin_allowed():
+                self.send_json({"error": "只接受本机助手和扩展读取定时结果。"}, HTTPStatus.FORBIDDEN)
+                return
+            self.send_json({"summary": LAST_SCHEDULED.get("summary")})
+            return
+        if path == "/api/radar/scheduled/results":
+            if not self.extension_origin_allowed():
+                self.send_json({"error": "只接受本机助手读取定时结果。"}, HTTPStatus.FORBIDDEN)
+                return
+            self.send_json({
+                "jobs": LAST_SCHEDULED.get("jobs", []),
+                "profile": LAST_SCHEDULED.get("profile"),
+                "engine": LAST_SCHEDULED.get("engine"),
+                "summary": LAST_SCHEDULED.get("summary"),
+            })
+            return
         if path == "/api/extension/latest":
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -2021,6 +2213,50 @@ class AppHandler(BaseHTTPRequestHandler):
                     "warning": plan.get("warning"),
                 })
                 return
+            if path == "/api/radar/schedule":
+                payload = json.loads(body.decode("utf-8"))
+                enabled = bool(payload.get("enabled"))
+                try:
+                    hour = int(payload.get("hour", 9))
+                    minute = int(payload.get("minute", 0))
+                except (TypeError, ValueError):
+                    raise ValueError("定时时间格式不正确。")
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError("定时时间格式不正确。")
+                platforms = [
+                    str(item) for item in payload.get("platforms", ["zhaopin", "boss"])
+                    if str(item) in {"zhaopin", "boss"}
+                ]
+                if not platforms:
+                    platforms = ["zhaopin", "boss"]
+                profile = payload.get("profile")
+                if enabled and not isinstance(profile, dict):
+                    raise ValueError("请先上传并分析简历，再开启定时雷达。")
+                with EXTENSION_INBOX_LOCK:
+                    SCHEDULE_CONFIG.update({
+                        "enabled": enabled,
+                        "hour": hour,
+                        "minute": minute,
+                        "platforms": platforms,
+                        "profile": profile if isinstance(profile, dict) else None,
+                        "provider": resolve_provider(payload.get("provider")),
+                        "updatedAt": int(time.time()),
+                    })
+                    _save_radar_store()
+                self.send_json({"ok": True, "schedule": public_schedule()})
+                return
+            if path == "/api/radar/scheduled/start":
+                if not self.extension_origin_allowed():
+                    self.send_json({"error": "只接受本机岗位采集扩展启动定时雷达。"}, HTTPStatus.FORBIDDEN)
+                    return
+                session_id, radar = start_scheduled_radar()
+                self.send_json({
+                    "ok": True,
+                    "sessionId": session_id,
+                    "radar": radar,
+                    "firstTask": radar.get("currentTask"),
+                })
+                return
             if path == "/api/radar/cancel":
                 payload = json.loads(body.decode("utf-8"))
                 session_id = normalize_session_id(payload.get("sessionId"))
@@ -2068,9 +2304,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("请先上传并分析简历。")
                 session_id = normalize_session_id(payload.get("sessionId"))
                 jobs, radar = radar_job_pool(session_id)
-                if not jobs:
-                    raise ValueError("岗位雷达还没有采集到岗位，请确认扩展已经更新并且招聘页面能够正常显示。")
-                ranked, excluded_count, warning = finalize_radar_jobs(profile, jobs, provider_id)
+                stored_jobs = None
+                stored_excluded = 0
+                stored_warning = None
+                with EXTENSION_INBOX_LOCK:
+                    session = EXTENSION_SESSIONS.get(session_id)
+                    if isinstance(session, dict) and session.get("finalizedJobs"):
+                        stored_jobs = session["finalizedJobs"]
+                        stored_excluded = int(session.get("excludedCount", 0))
+                        stored_warning = (session.get("radar") or {}).get("warning")
+                if stored_jobs:
+                    ranked, excluded_count, warning = stored_jobs, stored_excluded, stored_warning
+                else:
+                    if not jobs:
+                        raise ValueError("岗位雷达还没有采集到岗位，请确认扩展已经更新并且招聘页面能够正常显示。")
+                    ranked, excluded_count, warning = finalize_radar_jobs(profile, jobs, provider_id)
                 if not ranked:
                     raise ValueError("采集到的岗位都被当前硬性条件排除了，请放宽城市、薪资或应届条件。")
                 radar = mark_radar_finalized(session_id)

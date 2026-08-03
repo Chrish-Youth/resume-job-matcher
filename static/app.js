@@ -3,7 +3,8 @@ const state = {
   engine: null, providerStatus: null, jobSource: "示例岗位",
   extensionSequence: 0, extensionImporting: false, extensionPlatforms: [], pendingCapturePlatform: null,
   captureSessionId: createSessionId(), modalReturnFocus: null, sourceMeta: null,
-  radar: null, radarFinalizing: false, resultView: "all", batchGreetings: [], blockedNotified: false
+  radar: null, radarFinalizing: false, resultView: "all", batchGreetings: [], blockedNotified: false,
+  lastScheduledSeen: null
 };
 const WORKSPACE_STORAGE_KEY = "zhideWorkspaceV2";
 const PROVIDER_STORAGE_KEY = "zhideProviderV1";
@@ -25,7 +26,11 @@ const els = {
   autoStartRadar: $("#autoStartRadar"), batchGreeting: $("#batchGreeting"),
   batchGreetingModal: $("#batchGreetingModal"), batchGreetingList: $("#batchGreetingList"),
   batchToneTabs: $("#batchToneTabs"), copyAllGreetings: $("#copyAllGreetings"),
-  downloadGreetings: $("#downloadGreetings"), batchGreetingModalClose: $("#batchGreetingModalClose")
+  downloadGreetings: $("#downloadGreetings"), batchGreetingModalClose: $("#batchGreetingModalClose"),
+  scheduleEnabled: $("#scheduleEnabled"), scheduleTime: $("#scheduleTime"), saveSchedule: $("#saveSchedule"),
+  scheduleState: $("#scheduleState"), scheduledResult: $("#scheduledResult"),
+  scheduledResultTitle: $("#scheduledResultTitle"), scheduledResultText: $("#scheduledResultText"),
+  loadScheduledResults: $("#loadScheduledResults")
 };
 
 bootstrap();
@@ -33,6 +38,8 @@ bootstrap();
 async function bootstrap() {
   await loadProviderStatus();
   restoreWorkspace();
+  loadScheduleConfig();
+  checkScheduledSummary();
 }
 
 function createSessionId() {
@@ -873,9 +880,99 @@ function notifyRadarBlocked(reason) {
   } catch { /* 通知不可用时静默降级为页面内提示 */ }
 }
 
+function renderScheduleState(data) {
+  els.scheduleState.textContent = data.enabled
+    ? `每天 ${String(data.hour).padStart(2, "0")}:${String(data.minute).padStart(2, "0")} 运行`
+    : "未开启";
+}
+
+async function loadScheduleConfig() {
+  try {
+    const response = await fetch("/api/radar/schedule");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "读取定时设置失败");
+    els.scheduleEnabled.checked = Boolean(data.enabled);
+    els.scheduleTime.value = `${String(data.hour).padStart(2, "0")}:${String(data.minute).padStart(2, "0")}`;
+    renderScheduleState(data);
+  } catch { /* 服务未启动时保持默认设置 */ }
+}
+
+async function saveSchedule() {
+  const enabled = els.scheduleEnabled.checked;
+  if (enabled && !state.profile) return showToast("请先上传并分析简历，再开启定时雷达");
+  const [hour, minute] = els.scheduleTime.value.split(":").map(Number);
+  try {
+    const response = await fetch("/api/radar/schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled,
+        hour: Number.isFinite(hour) ? hour : 9,
+        minute: Number.isFinite(minute) ? minute : 0,
+        platforms: ["zhaopin", "boss"],
+        provider: currentProvider(),
+        profile: enabled ? profileForRequest() : null
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "保存失败");
+    renderScheduleState(data.schedule);
+    showToast(enabled
+      ? `已开启定时雷达，每天 ${String(data.schedule.hour).padStart(2, "0")}:${String(data.schedule.minute).padStart(2, "0")} 自动运行`
+      : "定时雷达已关闭");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function checkScheduledSummary() {
+  try {
+    const response = await fetch("/api/radar/scheduled/last");
+    const data = await response.json();
+    if (!response.ok || !data.summary || !data.summary.runId) return;
+    if (data.summary.runId === state.lastScheduledSeen) return;
+    state.lastScheduledSeen = data.summary.runId;
+    els.scheduledResultTitle.textContent = data.summary.newCount > 0
+      ? `定时雷达发现 ${data.summary.newCount} 个新岗位`
+      : "定时雷达已完成本轮采集";
+    els.scheduledResultText.textContent = data.summary.message;
+    els.scheduledResult.classList.remove("hidden");
+  } catch { /* 忽略瞬时错误 */ }
+}
+
+async function loadScheduledResults() {
+  try {
+    const response = await fetch("/api/radar/scheduled/results");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "载入失败");
+    if (!data.jobs?.length) return showToast("定时雷达还没有结果");
+    state.profile = data.profile || state.profile;
+    state.jobs = data.jobs;
+    state.visibleJobs = data.jobs;
+    state.jobSource = "定时雷达";
+    state.extensionPlatforms = ["智联招聘", "BOSS直聘"];
+    state.captureSessionId = createSessionId();
+    state.radar = null;
+    state.resultView = "all";
+    applyEngine(data.engine || { mode: "local" }, false);
+    renderProfile();
+    refreshFilterOptions(true);
+    filterAndRender();
+    renderRadar();
+    updateSourceNotice();
+    saveWorkspace();
+    els.scheduledResult.classList.add("hidden");
+    showToast(`已载入 ${data.jobs.length} 个定时雷达结果`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 els.startRadar.addEventListener("click", startRadar);
 els.stopRadar.addEventListener("click", stopRadar);
 els.resumeRadar.addEventListener("click", resumeRadar);
+els.saveSchedule.addEventListener("click", saveSchedule);
+els.loadScheduledResults.addEventListener("click", loadScheduledResults);
 
 async function resumeRadar() {
   if (!state.radar) return;
@@ -1062,6 +1159,7 @@ setInterval(() => {
   checkExtensionInbox();
   checkRadarStatus();
 }, 2200);
+setInterval(checkScheduledSummary, 30000);
 
 function openBossModal() {
   if (!state.profile) return showToast("请先上传并分析简历");
