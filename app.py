@@ -55,57 +55,112 @@ SEARCH_TIER_LABELS = {
     "adjacent": "相邻岗位",
     "transferable": "能力可迁移",
 }
+
+# 领域知识单一来源：新增/修改求职方向时只需维护这里。
+# 派生出的 ROLE_SEARCH_FAMILIES、ZHAOPIN_TOPIC_PAGES、SCORE_FAMILIES
+# 分别供搜索词规划、智联专题页发现和本地评分使用。
+DOMAINS = [
+    {
+        "id": "environment",
+        "label": "环境",
+        "triggers": {"环境工程", "环境监测", "水质分析", "污染治理", "环境规划", "环评", "环保", "arcgis"},
+        "skills": {"环境工程", "环境监测", "水质分析", "污染治理", "环境规划", "环评", "ArcGIS", "CAD"},
+        "search": {
+            "exact": ["环境工程师", "环保工程师", "环境监测", "环评助理"],
+            "adjacent": ["EHS专员", "水质检测", "水处理工程师"],
+            "transferable": ["实验室检测", "环境项目助理"],
+        },
+        "zhaopinPages": [
+            (("环境", "环保", "污染", "水质", "环评", "生态"), [
+                "https://www.zhaopin.com/zhaopin/414ecb316c57480b93a4771969e14227/",
+                "https://www.zhaopin.com/zhaopin/d5a6c3dab1f94d4796502d853e1182fe/",
+                "https://www.zhaopin.com/zhaopin/4502c3fead2045fbb64e048a04007609/",
+            ]),
+            (("监测", "检测", "采样", "实验室"), [
+                "https://www.zhaopin.com/zhaopin/5a345c979cb84714a938f81903b55db9/",
+                "https://www.zhaopin.com/zhaopin/ac702fac45c5431bb5f2d5abaeeb47d9/",
+            ]),
+        ],
+    },
+    {
+        "id": "data",
+        "label": "数据分析",
+        "triggers": {"数据分析", "sql", "python", "excel", "数据运营"},
+        "skills": {"数据分析", "SQL", "Python", "Excel"},
+        "search": {
+            "exact": ["数据分析师", "数据运营", "商业分析助理", "运营分析"],
+            "adjacent": ["业务分析", "策略运营", "数据专员"],
+            "transferable": ["项目助理", "数据管理"],
+        },
+        "zhaopinPages": [],
+    },
+    {
+        "id": "operations",
+        "label": "用户运营",
+        "triggers": {"用户运营", "社群运营", "活动策划", "运营"},
+        "skills": {"用户运营", "社群运营", "活动策划", "数据分析"},
+        "search": {
+            "exact": ["用户运营", "社群运营", "活动运营", "运营专员"],
+            "adjacent": ["产品运营", "内容运营", "会员运营"],
+            "transferable": ["项目助理", "客户成功"],
+        },
+        "zhaopinPages": [
+            (("用户运营", "社群", "活动运营", "运营"), [
+                "https://www.zhaopin.com/zhaopin/13f03631c1c54ca8b961a4e55b528d5b/",
+                "https://www.zhaopin.com/zhaopin/5ed7eeb7766049108547c8ea118affb0/",
+            ]),
+        ],
+    },
+    {
+        "id": "content",
+        "label": "新媒体",
+        "triggers": {"新媒体", "文案", "短视频", "品牌运营", "内容运营"},
+        "skills": {"新媒体", "文案", "短视频", "品牌运营"},
+        "search": {
+            "exact": ["新媒体运营", "内容运营", "短视频运营", "文案策划"],
+            "adjacent": ["品牌运营", "社交媒体运营", "活动策划"],
+            "transferable": ["市场助理", "项目助理"],
+        },
+        "zhaopinPages": [],
+    },
+    {
+        "id": "retail",
+        "label": "门店零售",
+        "triggers": {"门店运营", "顾客服务", "库存管理", "销售", "零售"},
+        "skills": {"门店运营", "顾客服务", "销售", "库存管理"},
+        "search": {
+            "exact": ["门店运营", "零售运营", "运营管培生", "储备店长"],
+            "adjacent": ["商品运营", "会员运营", "区域运营"],
+            "transferable": ["客户服务", "项目助理"],
+        },
+        "zhaopinPages": [
+            (("门店", "零售", "导购", "销售"), [
+                "https://www.zhaopin.com/zhaopin/4fbbe7d86ed441b2aa8dbc2f50c33988/",
+                "https://www.zhaopin.com/zhaopin/5ed7eeb7766049108547c8ea118affb0/",
+            ]),
+        ],
+    },
+]
+
 ROLE_SEARCH_FAMILIES = [
     {
-        "triggers": {"环境工程", "环境监测", "水质分析", "污染治理", "环境规划", "环评", "环保", "arcgis"},
-        "exact": ["环境工程师", "环保工程师", "环境监测", "环评助理"],
-        "adjacent": ["EHS专员", "水质检测", "水处理工程师"],
-        "transferable": ["实验室检测", "环境项目助理"],
-    },
-    {
-        "triggers": {"数据分析", "sql", "python", "excel", "数据运营"},
-        "exact": ["数据分析师", "数据运营", "商业分析助理", "运营分析"],
-        "adjacent": ["业务分析", "策略运营", "数据专员"],
-        "transferable": ["项目助理", "数据管理"],
-    },
-    {
-        "triggers": {"用户运营", "社群运营", "活动策划", "运营"},
-        "exact": ["用户运营", "社群运营", "活动运营", "运营专员"],
-        "adjacent": ["产品运营", "内容运营", "会员运营"],
-        "transferable": ["项目助理", "客户成功"],
-    },
-    {
-        "triggers": {"新媒体", "文案", "短视频", "品牌运营", "内容运营"},
-        "exact": ["新媒体运营", "内容运营", "短视频运营", "文案策划"],
-        "adjacent": ["品牌运营", "社交媒体运营", "活动策划"],
-        "transferable": ["市场助理", "项目助理"],
-    },
-    {
-        "triggers": {"门店运营", "顾客服务", "库存管理", "销售", "零售"},
-        "exact": ["门店运营", "零售运营", "运营管培生", "储备店长"],
-        "adjacent": ["商品运营", "会员运营", "区域运营"],
-        "transferable": ["客户服务", "项目助理"],
-    },
+        "triggers": set(domain["triggers"]),
+        "exact": list(domain["search"]["exact"]),
+        "adjacent": list(domain["search"]["adjacent"]),
+        "transferable": list(domain["search"]["transferable"]),
+    }
+    for domain in DOMAINS
 ]
+
+# 扁平化智联专题页。顺序按 DOMAINS 排列；关键词同时命中多个专题组时，
+# 所有候选页面都会依次尝试，因此页面间的先后顺序只影响默认来源标签。
 ZHAOPIN_TOPIC_PAGES = [
-    (("环境", "环保", "污染", "水质", "环评", "生态"), [
-        "https://www.zhaopin.com/zhaopin/414ecb316c57480b93a4771969e14227/",
-        "https://www.zhaopin.com/zhaopin/d5a6c3dab1f94d4796502d853e1182fe/",
-        "https://www.zhaopin.com/zhaopin/4502c3fead2045fbb64e048a04007609/",
-    ]),
-    (("监测", "检测", "采样", "实验室"), [
-        "https://www.zhaopin.com/zhaopin/5a345c979cb84714a938f81903b55db9/",
-        "https://www.zhaopin.com/zhaopin/ac702fac45c5431bb5f2d5abaeeb47d9/",
-    ]),
-    (("门店", "零售", "导购", "销售"), [
-        "https://www.zhaopin.com/zhaopin/4fbbe7d86ed441b2aa8dbc2f50c33988/",
-        "https://www.zhaopin.com/zhaopin/5ed7eeb7766049108547c8ea118affb0/",
-    ]),
-    (("用户运营", "社群", "活动运营", "运营"), [
-        "https://www.zhaopin.com/zhaopin/13f03631c1c54ca8b961a4e55b528d5b/",
-        "https://www.zhaopin.com/zhaopin/5ed7eeb7766049108547c8ea118affb0/",
-    ]),
+    (tokens, urls)
+    for domain in DOMAINS
+    for tokens, urls in domain.get("zhaopinPages", [])
 ]
+
+SCORE_FAMILIES = [set(domain["skills"]) for domain in DOMAINS]
 
 
 def load_env_file() -> None:
@@ -269,7 +324,21 @@ SKILL_ALIASES = {
     "品牌运营": ["品牌运营", "品牌推广", "品牌营销"],
     "跨部门协作": ["跨部门", "团队协作", "沟通协调"],
     "英语": ["英语", "cet-4", "cet4", "cet-6", "cet6", "雅思", "托福"],
+    "环境工程": ["环境工程", "环保工程", "环境治理"],
+    "环境监测": ["环境监测", "水质监测", "环境检测", "大气监测"],
+    "水质分析": ["水质分析", "水质检测"],
+    "污染治理": ["污染治理", "污水治理", "废气治理"],
+    "环境规划": ["环境规划", "环境影响评价"],
+    "环评": ["环评", "环境影响评价"],
+    "ArcGIS": ["arcgis", "gis"],
+    "CAD": ["cad", "autocad"],
 }
+
+_missing_skill_aliases = {
+    skill for domain in DOMAINS for skill in domain["skills"]
+} - set(SKILL_ALIASES)
+if _missing_skill_aliases:
+    raise RuntimeError(f"领域配置引用了未定义别名的技能：{sorted(_missing_skill_aliases)}")
 
 
 def extract_docx(data: bytes) -> str:
@@ -647,17 +716,10 @@ def score_job(profile: dict, job: dict) -> dict:
     profile_skills = set(profile.get("skills", []))
     job_tags = set(job["tags"])
     overlaps = [tag for tag in job.get("tags", []) if tag in profile_skills]
-    related = 0
-    families = [
-        {"门店运营", "顾客服务", "销售", "库存管理"},
-        {"用户运营", "社群运营", "活动策划", "数据分析"},
-        {"新媒体", "文案", "短视频", "品牌运营"},
-        {"数据分析", "Excel", "SQL", "Python"},
-        {"环境工程", "环境监测", "水质分析", "污染治理", "环境规划", "环评", "ArcGIS", "CAD"},
-    ]
-    for family in families:
-        if profile_skills & family and job_tags & family:
-            related += 1
+    related = sum(
+        1 for family in SCORE_FAMILIES
+        if profile_skills & family and job_tags & family
+    )
     profile_direction = f"{profile.get('target', '')} {profile.get('searchKeyword', '')}".lower()
     job_text = f"{job.get('title', '')} {' '.join(job.get('tags', []))} {job.get('description', '')}".lower()
     direction_tokens = []

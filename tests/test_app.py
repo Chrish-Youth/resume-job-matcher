@@ -3,6 +3,7 @@ import re
 import unittest
 import urllib.error
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
 import app
@@ -251,6 +252,56 @@ class LlmRetryTests(unittest.TestCase):
 
         self.assertEqual(calls["count"], 1)
         fake_sleep.assert_not_called()
+
+
+class ZhaopinParserTests(unittest.TestCase):
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "zhaopin_joblist_sample.html"
+
+    def test_parse_realistic_joblist_fixture(self):
+        page_html = self.FIXTURE.read_text(encoding="utf-8")
+        jobs = app.parse_zhaopin_jobs(page_html, limit=5)
+        self.assertEqual(len(jobs), 2)
+        first = jobs[0]
+        self.assertEqual(first["id"], "zl-live-CCL1321031340J40138019907")
+        self.assertIn("实习生", first["title"])
+        self.assertIn("律师", first["company"])
+        self.assertEqual(first["salary"], "1000-2000元")
+        self.assertIn("重庆", first["location"])
+        self.assertEqual(first["education"], "本科")
+        self.assertIn("法律", first["tags"])
+        self.assertTrue(first["url"].startswith("https://www.zhaopin.com/jobdetail/"))
+        self.assertEqual(first["source"], "智联招聘公开页")
+
+    def test_parse_rejects_page_without_job_cards(self):
+        with self.assertRaises(ValueError):
+            app.parse_zhaopin_jobs("<html><body>没有职位卡片</body></html>", limit=5)
+
+
+class DomainConfigTests(unittest.TestCase):
+    def test_derived_tables_match_domain_source(self):
+        expected_families = [
+            {
+                "triggers": set(domain["triggers"]),
+                "exact": list(domain["search"]["exact"]),
+                "adjacent": list(domain["search"]["adjacent"]),
+                "transferable": list(domain["search"]["transferable"]),
+            }
+            for domain in app.DOMAINS
+        ]
+        self.assertEqual(app.ROLE_SEARCH_FAMILIES, expected_families)
+
+        expected_pages = [
+            (tokens, urls)
+            for domain in app.DOMAINS
+            for tokens, urls in domain.get("zhaopinPages", [])
+        ]
+        self.assertEqual(app.ZHAOPIN_TOPIC_PAGES, expected_pages)
+        self.assertEqual(app.SCORE_FAMILIES, [set(domain["skills"]) for domain in app.DOMAINS])
+
+    def test_every_domain_skill_has_alias(self):
+        for domain in app.DOMAINS:
+            for skill in domain["skills"]:
+                self.assertIn(skill, app.SKILL_ALIASES, f"{domain['id']} 的技能 {skill} 缺少别名")
 
 
 if __name__ == "__main__":
