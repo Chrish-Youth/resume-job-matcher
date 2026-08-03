@@ -1,6 +1,8 @@
 import json
 import re
 import unittest
+import urllib.error
+from io import BytesIO
 from unittest.mock import patch
 
 import app
@@ -181,6 +183,74 @@ class ExtensionSessionTests(unittest.TestCase):
         self.assertEqual(updated["duplicates"], 1)
         self.assertEqual(len(pool), 1)
         self.assertEqual(pool[0]["searchTier"], first_task["tier"])
+
+
+class HostValidationTests(unittest.TestCase):
+    def test_host_header_allowed(self):
+        allowed = {
+            "127.0.0.1:8765", "localhost:8765", "[::1]:8765",
+            "127.0.0.1", "localhost", "  LOCALHOST:8765 ",
+        }
+        for host in allowed:
+            self.assertTrue(app.host_header_allowed(host), host)
+
+    def test_host_header_rejects_foreign_and_malformed(self):
+        rejected = {
+            "", "evil.example.com", "evil.example.com:8765",
+            "127.0.0.1:9999", "127.0.0.2:8765", "example.com:80",
+        }
+        for host in rejected:
+            self.assertFalse(app.host_header_allowed(host), host)
+
+
+class LlmRetryTests(unittest.TestCase):
+    def test_call_llm_retries_transient_error_then_succeeds(self):
+        calls = {"count": 0}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        def fake_urlopen(_request, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise urllib.error.HTTPError(
+                    "https://example.test", 429, "Too Many Requests", {}, BytesIO(b"rate limited")
+                )
+            return FakeResponse()
+
+        with patch.object(app.os, "getenv", return_value="test-key"), \
+                patch.object(app.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                patch.object(app.time, "sleep") as fake_sleep:
+            content = app.call_llm("qwen", [{"role": "user", "content": "hi"}])
+
+        self.assertEqual(content, "ok")
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(fake_sleep.call_count, 1)
+
+    def test_call_llm_does_not_retry_non_transient_error(self):
+        calls = {"count": 0}
+
+        def fake_urlopen(_request, **_kwargs):
+            calls["count"] += 1
+            raise urllib.error.HTTPError(
+                "https://example.test", 400, "Bad Request", {}, BytesIO(b"bad")
+            )
+
+        with patch.object(app.os, "getenv", return_value="test-key"), \
+                patch.object(app.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                patch.object(app.time, "sleep") as fake_sleep:
+            with self.assertRaises(ValueError):
+                app.call_llm("qwen", [{"role": "user", "content": "hi"}])
+
+        self.assertEqual(calls["count"], 1)
+        fake_sleep.assert_not_called()
 
 
 if __name__ == "__main__":
