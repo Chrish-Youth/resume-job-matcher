@@ -184,6 +184,36 @@
     return jobs;
   }
 
+  function collectCurrentJobDetail(platform) {
+    const selectors = platform === "boss"
+      ? [".job-sec-text", ".job-detail-section", ".job-detail", "[class*='job-detail']", "[class*='job-description']"]
+      : [".describtion__detail-content", ".job-detail", "[class*='job-detail']", "[class*='description']", "[class*='job-content']"];
+    const sections = [];
+    for (const selector of selectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        const value = clean(node.innerText || node.textContent);
+        if (value.length >= 80 && value.length <= 12000) sections.push(value);
+      }
+    }
+    let description = uniq(sections).sort((left, right) => right.length - left.length)[0] || "";
+    if (description.length < 120) {
+      const body = clean(document.body?.innerText || "");
+      const marker = body.search(/职位描述|岗位职责|工作职责|职位要求|任职要求/);
+      if (marker >= 0) description = body.slice(marker, marker + 6000);
+    }
+    const meta = metaFrom(description);
+    const tagNodes = document.querySelectorAll("[class*='tag'] span, [class*='skill'] span, [class*='label']");
+    const tags = uniq([...tagNodes].map(node => node.textContent))
+      .filter(item => item.length >= 2 && item.length <= 30)
+      .slice(0, 16);
+    return {
+      description: description.slice(0, 6000),
+      tags,
+      education: meta.education,
+      experience: meta.experience
+    };
+  }
+
   async function reportRadarBlocked(sessionId, taskId, reason) {
     try {
       const response = await fetch("http://127.0.0.1:8765/api/radar/blocked", {
@@ -249,40 +279,75 @@
     if (!active.sessionId || !radar?.active || !task || task.platform !== platform) return;
     let readableUrl = location.href.toLowerCase();
     try { readableUrl = decodeURIComponent(location.href).toLowerCase(); } catch { /* 保留编码后的地址 */ }
-    if (!readableUrl.includes(String(task.query || "").toLowerCase())) return;
+    if (task.type === "detail") {
+      try {
+        const currentPath = new URL(location.href).pathname.replace(/\/$/, "");
+        const taskPath = new URL(task.url).pathname.replace(/\/$/, "");
+        if (!currentPath || currentPath !== taskPath) return;
+      } catch { return; }
+    } else if (!readableUrl.includes(String(task.query || "").toLowerCase())) return;
     const runKey = `zhideRadar:${active.sessionId}:${task.id}`;
     if (sessionStorage.getItem(runKey)) return;
     sessionStorage.setItem(runKey, "1");
     showRadarStatus(`岗位雷达 ${radar.completed + 1}/${radar.total}：正在采集「${task.query}」`);
     try {
-      const jobs = await collectWithRetry(platform, 3);
       let result;
-      if (!jobs.length) {
-        const reason = blockedPageReason();
-        if (reason) {
-          const blocked = await reportRadarBlocked(active.sessionId, task.id, reason);
-          if (blocked?.ok) {
-            sessionStorage.removeItem(runKey);
-            sessionStorage.setItem(`zhideRadarBlocked:${active.sessionId}:${task.id}`, "1");
-            showRadarStatus(reason, "error");
-            return;
+      if (task.type === "detail") {
+        const detail = collectCurrentJobDetail(platform);
+        if (detail.description.length < 120) {
+          const reason = blockedPageReason();
+          if (reason) {
+            const blocked = await reportRadarBlocked(active.sessionId, task.id, reason);
+            if (blocked?.ok) {
+              sessionStorage.removeItem(runKey);
+              sessionStorage.setItem(`zhideRadarBlocked:${active.sessionId}:${task.id}`, "1");
+              showRadarStatus(reason, "error");
+              return;
+            }
           }
         }
-        result = await sendRadarSkip(active.sessionId, task.id);
-      } else {
         const response = await fetch("http://127.0.0.1:8765/api/extension/collect", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             platform,
-            jobs,
+            detail,
             url: location.href,
             pageTitle: document.title,
             radarTaskId: task.id
           })
         });
         result = await response.json();
-        if (!response.ok) throw new Error(result.error || "岗位回传失败。");
+        if (!response.ok) throw new Error(result.error || "岗位详情回传失败。");
+      } else {
+        const jobs = await collectWithRetry(platform, 3);
+        if (!jobs.length) {
+          const reason = blockedPageReason();
+          if (reason) {
+            const blocked = await reportRadarBlocked(active.sessionId, task.id, reason);
+            if (blocked?.ok) {
+              sessionStorage.removeItem(runKey);
+              sessionStorage.setItem(`zhideRadarBlocked:${active.sessionId}:${task.id}`, "1");
+              showRadarStatus(reason, "error");
+              return;
+            }
+          }
+          result = await sendRadarSkip(active.sessionId, task.id);
+        } else {
+          const response = await fetch("http://127.0.0.1:8765/api/extension/collect", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              platform,
+              jobs,
+              url: location.href,
+              pageTitle: document.title,
+              radarTaskId: task.id
+            })
+          });
+          result = await response.json();
+          if (!response.ok) throw new Error(result.error || "岗位回传失败。");
+        }
       }
       await continueRadar(result.nextTask, result.radar?.completed || radar.completed + 1, result.radar?.total || radar.total);
     } catch (error) {

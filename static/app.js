@@ -4,7 +4,7 @@ const state = {
   extensionSequence: 0, extensionImporting: false, extensionPlatforms: [], pendingCapturePlatform: null,
   captureSessionId: createSessionId(), modalReturnFocus: null, sourceMeta: null,
   radar: null, radarFinalizing: false, resultView: "all", batchGreetings: [], blockedNotified: false,
-  lastScheduledSeen: null
+  lastScheduledSeen: null, feedback: {}, pendingFeedbackJob: null
 };
 const WORKSPACE_STORAGE_KEY = "zhideWorkspaceV2";
 const PROVIDER_STORAGE_KEY = "zhideProviderV1";
@@ -30,13 +30,13 @@ const els = {
   scheduleEnabled: $("#scheduleEnabled"), scheduleTime: $("#scheduleTime"), saveSchedule: $("#saveSchedule"),
   scheduleState: $("#scheduleState"), scheduledResult: $("#scheduledResult"),
   scheduledResultTitle: $("#scheduledResultTitle"), scheduledResultText: $("#scheduledResultText"),
-  loadScheduledResults: $("#loadScheduledResults")
+  loadScheduledResults: $("#loadScheduledResults"), feedbackModal: $("#feedbackModal")
 };
 
 bootstrap();
 
 async function bootstrap() {
-  await loadProviderStatus();
+  await Promise.all([loadProviderStatus(), loadFeedback()]);
   restoreWorkspace();
   loadScheduleConfig();
   checkScheduledSummary();
@@ -57,7 +57,19 @@ function currentPreferences() {
 }
 
 function profileForRequest() {
-  return { ...state.profile, preferences: currentPreferences() };
+  return {
+    ...state.profile,
+    preferences: currentPreferences(),
+    feedback: Object.values(state.feedback).slice(-80)
+  };
+}
+
+async function loadFeedback() {
+  try {
+    const response = await fetch("/api/feedback", { cache: "no-store" });
+    const data = await response.json();
+    if (response.ok && data.feedback && typeof data.feedback === "object") state.feedback = data.feedback;
+  } catch { /* 本地服务刚启动时稍后仍可保存反馈 */ }
 }
 
 function saveWorkspace() {
@@ -104,7 +116,7 @@ function restoreWorkspace() {
   state.extensionPlatforms = Array.isArray(saved.extensionPlatforms) ? saved.extensionPlatforms : [];
   if (saved.captureSessionId) state.captureSessionId = saved.captureSessionId;
   state.radar = saved.radar || null;
-  state.resultView = ["all", "strong", "transferable", "new"].includes(saved.resultView) ? saved.resultView : "all";
+  state.resultView = ["all", "strong", "transferable", "saved", "new"].includes(saved.resultView) ? saved.resultView : "all";
   renderProfile();
   setSearchPreferences(saved.preferences);
   refreshFilterOptions(true);
@@ -124,9 +136,17 @@ function restoreWorkspace() {
   showToast("已恢复上次保存在本机的求职工作区");
 }
 
-function clearWorkspace() {
-  localStorage.removeItem(WORKSPACE_STORAGE_KEY);
-  window.location.reload();
+async function clearWorkspace() {
+  if (!window.confirm("确定清除本机保存的简历画像、岗位、定时雷达和反馈记录吗？")) return;
+  try {
+    const response = await fetch("/api/local-data/clear", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "清理失败");
+    localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+    window.location.reload();
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 $("#clearWorkspace").addEventListener("click", clearWorkspace);
@@ -256,6 +276,17 @@ function setSearchPreferences(savedPreferences = null) {
   syncManualBossUrl();
 }
 
+function feedbackForJob(job) {
+  const title = String(job.title || "").trim().toLowerCase();
+  const company = String(job.company || "").trim().toLowerCase();
+  const location = String(job.location || "").trim().toLowerCase();
+  return Object.values(state.feedback).find(item =>
+    String(item.title || "").trim().toLowerCase() === title &&
+    String(item.company || "").trim().toLowerCase() === company &&
+    String(item.location || "").trim().toLowerCase() === location
+  ) || null;
+}
+
 function filterAndRender() {
   const keyword = els.searchInput.value.trim().toLowerCase();
   const targetCity = els.targetCity.value;
@@ -264,6 +295,7 @@ function filterAndRender() {
   const education = els.educationFilter.value;
   const experience = els.experienceFilter.value;
   let jobs = state.jobs.filter(job => {
+    if (feedbackForJob(job)?.status === "dismissed") return false;
     if (!`${job.title}${job.company}${job.location}`.toLowerCase().includes(keyword)) return false;
     if (targetCity !== "全国" && jobCity(job) !== targetCity) return false;
     if (location !== "all" && jobCity(job) !== location) return false;
@@ -275,17 +307,24 @@ function filterAndRender() {
     return true;
   });
   const baseJobs = jobs;
-  const strongJobs = baseJobs.filter(job => ["A", "B"].includes(job.fitGrade || fitFromScore(job.score).grade));
-  const transferableJobs = baseJobs.filter(job => job.searchTier === "transferable" || (job.fitGrade || fitFromScore(job.score).grade) === "C");
+  const strongJobs = baseJobs.filter(job =>
+    job.searchTier !== "transferable" && effectiveFit(job).grade === "A"
+  );
+  const transferableJobs = baseJobs.filter(job =>
+    job.searchTier === "transferable" || ["B", "C"].includes(effectiveFit(job).grade)
+  );
+  const savedJobs = baseJobs.filter(job => feedbackForJob(job)?.status === "saved");
   const newJobs = baseJobs.filter(job => job.isNew);
   $("#allJobCount").textContent = baseJobs.length;
   $("#strongJobCount").textContent = strongJobs.length;
   $("#transferJobCount").textContent = transferableJobs.length;
+  $("#savedJobCount").textContent = savedJobs.length;
   $("#newJobCount").textContent = newJobs.length;
   if (state.resultView === "strong") jobs = strongJobs;
   else if (state.resultView === "transferable") jobs = transferableJobs;
+  else if (state.resultView === "saved") jobs = savedJobs;
   else if (state.resultView === "new") jobs = newJobs;
-  if (els.sortSelect.value === "score") jobs.sort((a, b) => b.score - a.score);
+  if (els.sortSelect.value === "score") jobs.sort((a, b) => effectiveScore(b) - effectiveScore(a));
   else jobs.sort((a, b) => (Number(b.capturedAt || 0) - Number(a.capturedAt || 0)) || (postedRank(b.posted) - postedRank(a.posted)));
   state.visibleJobs = jobs;
   $("#jobCount").textContent = jobs.length;
@@ -295,11 +334,13 @@ function filterAndRender() {
     ? "这个分组暂时没有岗位，切换到“全部”继续查看。"
     : activeFilterCount() ? "试试放宽或重置筛选条件。" : "换个职位或公司关键词试试。";
   els.jobList.innerHTML = jobs.map(job => {
-    const fit = job.fitGrade && job.fitLabel ? { grade: job.fitGrade, label: job.fitLabel } : fitFromScore(job.score);
+    const fit = effectiveFit(job);
     const matchedTags = Array.isArray(job.matchedTags) ? job.matchedTags : [];
     const reasons = Array.isArray(job.reasons) && job.reasons.length ? job.reasons.slice(0, 2) : ["建议打开原岗位核对职责与要求"];
     const gaps = Array.isArray(job.gaps) ? job.gaps.slice(0, 2) : [];
     const source = job.source || state.jobSource;
+    const feedback = feedbackForJob(job);
+    const evidenceLabel = effectiveEvidence(job).label;
     const logoColor = /^#[0-9a-f]{6}$/i.test(String(job.logoColor || "")) ? job.logoColor : "#17633f";
     return `
     <article class="job-card" data-grade="${escapeHtml(fit.grade)}">
@@ -312,13 +353,18 @@ function filterAndRender() {
           <div><b>推荐依据</b><span>${reasons.map(escapeHtml).join("；")}</span></div>
           ${gaps.length ? `<div class="gap-line"><b>需要核对</b><span>${gaps.map(escapeHtml).join("、")}</span></div>` : ""}
         </div>
-        <div class="job-source">${job.searchTierLabel ? `${escapeHtml(job.searchTierLabel)} · ` : ""}${job.searchQuery ? `搜索「${escapeHtml(job.searchQuery)}」 · ` : ""}${escapeHtml(source)} · ${job.matchEngine === "ai" ? "AI 评估" : "本地规则"}</div>
+        <div class="job-source">${job.searchTierLabel ? `${escapeHtml(job.searchTierLabel)} · ` : ""}${job.searchQuery ? `搜索「${escapeHtml(job.searchQuery)}」 · ` : ""}${escapeHtml(source)} · ${job.matchEngine === "ai" ? "AI 评估" : "本地规则"} · ${escapeHtml(evidenceLabel)}</div>
       </div>
       <div class="job-side">
         <div><div class="salary">${escapeHtml(job.salary)}</div><div class="job-meta">${escapeHtml(job.education)} · ${escapeHtml(job.experience)} · ${escapeHtml(job.posted)}</div></div>
         <div class="job-actions">
           <button class="greet-button" data-job-id="${job.id}" type="button">✦ 生成招呼语</button>
           <button class="chat-button" data-go-chat-id="${job.id}" type="button">去沟通 ↗</button>
+        </div>
+        <div class="feedback-actions">
+          ${feedback?.status === "contacted" ? '<span>✓ 已沟通</span>' : ""}
+          <button class="${feedback?.status === "saved" ? "active" : ""}" data-save-job-id="${job.id}" type="button">${feedback?.status === "saved" ? "★ 已收藏" : "☆ 收藏"}</button>
+          <button data-dismiss-job-id="${job.id}" type="button">不合适</button>
         </div>
       </div>
     </article>`;
@@ -415,6 +461,26 @@ function fitFromScore(score) {
   return { grade: "D", label: "匹配较弱" };
 }
 
+function effectiveEvidence(job) {
+  const description = String(job.description || "").replace(/\s+/g, " ").trim();
+  const tagCount = Array.isArray(job.tags) ? job.tags.filter(Boolean).length : 0;
+  if (job.detailStatus === "detail" && description.length >= 180) {
+    return { level: "detail", label: "岗位详情已复核", cap: 97 };
+  }
+  if (description.length >= 180 && tagCount >= 3) {
+    return { level: "summary", label: "列表信息较完整", cap: 85 };
+  }
+  return { level: "limited", label: "信息有限，建议核对", cap: 81 };
+}
+
+function effectiveScore(job) {
+  return Math.min(Number(job.score || 0), effectiveEvidence(job).cap);
+}
+
+function effectiveFit(job) {
+  return fitFromScore(effectiveScore(job));
+}
+
 function setDynamicOptions(select, values, allLabel, order = []) {
   select.replaceChildren(new Option(allLabel, "all"));
   const unique = [...new Set(values.filter(Boolean))];
@@ -450,10 +516,73 @@ function resetFilters(render = true) {
   if (render) { filterAndRender(); saveWorkspace(); } else updateFilterAppearance();
 }
 els.jobList.addEventListener("click", event => {
+  const saveButton = event.target.closest("[data-save-job-id]");
+  if (saveButton) {
+    toggleSavedJob(saveButton.dataset.saveJobId);
+    return;
+  }
+  const dismissButton = event.target.closest("[data-dismiss-job-id]");
+  if (dismissButton) {
+    openFeedbackModal(dismissButton.dataset.dismissJobId);
+    return;
+  }
   const button = event.target.closest("[data-job-id]");
   if (button) openGreeting(button.dataset.jobId);
   const chatButton = event.target.closest("[data-go-chat-id]");
   if (chatButton) openAndCopyGreeting(chatButton.dataset.goChatId, chatButton);
+});
+
+async function setJobFeedback(job, status, reason = "") {
+  const response = await fetch("/api/feedback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job, status, reason })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "反馈保存失败");
+  if (data.feedback) state.feedback[data.key] = data.feedback;
+  else delete state.feedback[data.key];
+  state.profile.feedback = Object.values(state.feedback).slice(-80);
+  filterAndRender();
+  saveWorkspace();
+}
+
+async function toggleSavedJob(jobId) {
+  const job = state.jobs.find(item => item.id === jobId);
+  if (!job) return;
+  const current = feedbackForJob(job);
+  try {
+    await setJobFeedback(job, current?.status === "saved" ? "none" : "saved");
+    showToast(current?.status === "saved" ? "已取消收藏" : "已收藏，后续会提高相似岗位权重");
+  } catch (error) { showToast(error.message); }
+}
+
+function openFeedbackModal(jobId) {
+  state.pendingFeedbackJob = state.jobs.find(item => item.id === jobId) || null;
+  if (!state.pendingFeedbackJob) return;
+  $("#feedbackJobTitle").textContent = `${state.pendingFeedbackJob.company} · ${state.pendingFeedbackJob.title}`;
+  showDialog(els.feedbackModal, "#feedbackReasons button");
+}
+
+function closeFeedbackModal() {
+  state.pendingFeedbackJob = null;
+  hideDialog(els.feedbackModal);
+}
+
+$("#feedbackModalClose").addEventListener("click", closeFeedbackModal);
+els.feedbackModal.addEventListener("click", event => { if (event.target === els.feedbackModal) closeFeedbackModal(); });
+$("#feedbackReasons").addEventListener("click", async event => {
+  const button = event.target.closest("button[data-reason]");
+  const job = state.pendingFeedbackJob;
+  if (!button || !job) return;
+  button.disabled = true;
+  try {
+    await setJobFeedback(job, "dismissed", button.dataset.reason);
+    closeFeedbackModal();
+    showToast(`已减少“${button.dataset.reason}”的相似岗位`);
+  } catch (error) {
+    showToast(error.message);
+  } finally { button.disabled = false; }
 });
 
 async function openAndCopyGreeting(jobId, button) {
@@ -475,6 +604,9 @@ async function openAndCopyGreeting(jobId, button) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "生成失败");
     await navigator.clipboard.writeText(data.greeting);
+    if (feedbackForJob(job)?.status !== "saved") {
+      try { await setJobFeedback(job, "contacted"); } catch { /* 沟通主流程不因反馈保存失败而中断 */ }
+    }
     button.textContent = "已复制 ✓";
     showToast(opened
       ? "岗位页已打开，招呼语已复制到剪贴板"
@@ -496,7 +628,7 @@ async function openGreeting(jobId) {
   $("#openJobPage").classList.toggle("hidden", !state.activeJob.url);
   state.tone = "professional";
   document.querySelectorAll("#toneTabs button").forEach(btn => btn.classList.toggle("active", btn.dataset.tone === state.tone));
-  const fit = state.activeJob.fitLabel || fitFromScore(state.activeJob.score).label;
+  const fit = effectiveFit(state.activeJob).label;
   $("#modalJob").textContent = `${state.activeJob.company} · ${state.activeJob.title} · ${fit}`;
   $("#platformNote").textContent = state.activeJob.source?.includes("BOSS")
     ? "可粘贴到 BOSS 直聘的聊天对话框中"
@@ -564,6 +696,7 @@ document.addEventListener("keydown", event => {
     else if (dialog === els.zhaopinModal) closeZhaopinModal();
     else if (dialog === els.extensionModal) closeExtensionModal();
     else if (dialog === els.batchGreetingModal) hideDialog(els.batchGreetingModal);
+    else if (dialog === els.feedbackModal) closeFeedbackModal();
     return;
   }
   if (event.key !== "Tab") return;
@@ -607,7 +740,9 @@ async function loadBatchGreetings() {
     const response = await fetchWithTimeout("/api/greetings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profile: profileForRequest(), jobs, tone: state.tone })
+      body: JSON.stringify({
+        profile: profileForRequest(), jobs, tone: state.tone, provider: currentProvider()
+      })
     }, 120000);
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "批量生成失败");
@@ -740,7 +875,7 @@ function renderRadar() {
   const progress = total ? Math.min(100, Math.round(completed / total * 100)) : 0;
   const current = radar.currentTask;
   const statusText = {
-    running: current ? `正在搜索「${current.query}」` : "正在连续采集岗位",
+    running: current?.type === "detail" ? `正在复核「${current.query}」岗位详情` : current ? `正在搜索「${current.query}」` : "正在连续采集岗位",
     ready: "采集完成，准备统一匹配",
     paused: "已停止采集，正在整理现有岗位",
     paused_blocked: "等待处理验证码 / 登录",
@@ -753,12 +888,14 @@ function renderRadar() {
     : radar.status === "paused_blocked"
     ? (radar.blockedReason || "招聘页面需要人工处理，完成后点击“继续雷达”。")
     : radar.status === "running"
-    ? `${current?.platformLabel || "招聘平台"} · ${current?.tierLabel || "扩展搜索范围"}`
+    ? current?.type === "detail"
+      ? `${current?.platformLabel || "招聘平台"} · 已复核 ${Number(radar.detailCompleted || 0)} / ${Number(radar.detailTotal || 0)} 个高潜岗位`
+      : `${current?.platformLabel || "招聘平台"} · ${current?.tierLabel || "扩展搜索范围"}`
     : radar.status === "finalized"
       ? "岗位已去重并完成统一评分，可按下方分组查看。"
       : "已采集的岗位会保留，不会因为停止而丢失。";
   $("#radarProgressText").textContent = `${completed} / ${total}`;
-  $("#radarProgressBar").style.width = `${progress}%`;
+  $("#radarProgressBar").style.transform = `scaleX(${progress / 100})`;
   $("#radarCollected").textContent = Number(radar.collected || 0);
   $("#radarUnique").textContent = Number(radar.unique || 0);
   $("#radarDuplicates").textContent = Number(radar.duplicates || 0);
@@ -783,7 +920,9 @@ function mergeRadarJobs(incoming) {
     const key = `${job.title}|${job.company}|${job.location}`.toLowerCase();
     const candidate = { ...job, isNew: !knownKeys.has(key) };
     const previous = merged.get(key);
-    if (!previous || candidate.score >= previous.score) merged.set(key, { ...candidate, isNew: candidate.isNew });
+    if (!previous || candidate.detailStatus === "detail" && previous.detailStatus !== "detail" || effectiveScore(candidate) >= effectiveScore(previous)) {
+      merged.set(key, { ...candidate, isNew: candidate.isNew });
+    }
   });
   return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 300);
 }
@@ -928,6 +1067,21 @@ function renderScheduleState(data) {
   els.scheduleState.textContent = data.enabled
     ? `每天 ${String(data.hour).padStart(2, "0")}:${String(data.minute).padStart(2, "0")} 运行`
     : "未开启";
+  const formatTime = value => value ? new Date(Number(value) * 1000).toLocaleString("zh-CN", { hour12: false }) : "";
+  const meta = $("#scheduleMeta");
+  if (data.storage?.ok === false) {
+    meta.textContent = `本机数据保存失败：${data.storage.error || "文件被占用"}`;
+    meta.classList.add("error");
+  } else if (data.lastError) {
+    meta.textContent = `上次自动运行失败：${data.lastError}`;
+    meta.classList.add("error");
+  } else if (data.lastStartedAt) {
+    meta.textContent = `上次成功启动：${formatTime(data.lastStartedAt)}；本地助手短暂关闭时，扩展会在恢复连接后补跑。`;
+    meta.classList.remove("error");
+  } else {
+    meta.textContent = "本地助手和浏览器都需要保持运行；若服务短暂关闭，恢复后会自动补跑。";
+    meta.classList.remove("error");
+  }
 }
 
 async function loadScheduleConfig() {
@@ -1148,7 +1302,7 @@ function mergeExtensionJobs(incoming) {
   [...base, ...incoming].forEach(job => {
     const key = `${job.title}|${job.company}|${job.location}`.toLowerCase();
     const existing = merged.get(key);
-    if (!existing || job.score > existing.score) merged.set(key, job);
+    if (!existing || job.detailStatus === "detail" && existing.detailStatus !== "detail" || effectiveScore(job) > effectiveScore(existing)) merged.set(key, job);
   });
   return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 80);
 }

@@ -35,6 +35,7 @@ def make_job(index: int, **overrides):
         "logoColor": "#17633f",
         "tags": ["环境监测", "数据分析"],
         "description": "负责环境监测、数据整理与报告编制。",
+        "detailStatus": "detail",
         "highlights": [],
         "posted": "今天",
     }
@@ -72,6 +73,26 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(result["gaps"], ["ArcGIS"])
         self.assertEqual(result["matchEngine"], "local")
 
+    def test_list_only_job_cannot_receive_grade_a(self):
+        result = app.score_job(self.profile, make_job(1, detailStatus="list"))
+        self.assertLessEqual(result["score"], 85)
+        self.assertNotEqual(result["fitGrade"], "A")
+        self.assertEqual(result["evidenceLevel"], "limited")
+
+    def test_feedback_changes_similar_job_score(self):
+        positive = {
+            **self.profile,
+            "feedback": [{
+                "status": "saved", "title": "环境工程师", "company": "旧公司",
+                "tags": ["环境监测", "数据分析"],
+            }],
+        }
+        detailed_job = make_job(1, title="环境工程师", description="环境监测、数据分析与报告编制。" * 20)
+        baseline = app.score_job(self.profile, detailed_job)
+        learned = app.score_job(positive, detailed_job)
+        self.assertGreater(learned["score"], baseline["score"])
+        self.assertTrue(any("感兴趣" in reason for reason in learned["reasons"]))
+
     def test_llm_matching_scores_every_batch(self):
         jobs = [make_job(index) for index in range(45)]
 
@@ -107,6 +128,32 @@ class MatchingTests(unittest.TestCase):
         self.assertTrue(any(task["platform"] == "zhaopin" for task in plan["tasks"]))
         self.assertTrue(any(task["platform"] == "boss" for task in plan["tasks"]))
         self.assertTrue(all("上海" in task["city"] for task in plan["tasks"]))
+
+    def test_search_plan_rejects_llm_queries_that_drift_from_profile(self):
+        profile = {
+            **self.profile,
+            "target": "数据运营方向",
+            "searchKeyword": "数据运营",
+            "skills": ["Excel", "数据分析", "用户运营"],
+        }
+        bad_response = json.dumps({
+            "groups": [
+                {"tier": "exact", "queries": ["行政助理", "文员", "数据录入员"]},
+                {"tier": "adjacent", "queries": ["财务助理", "运营助理"]},
+                {"tier": "transferable", "queries": ["客服专员", "档案管理员"]},
+            ]
+        }, ensure_ascii=False)
+
+        with patch.object(app, "call_llm", return_value=bad_response):
+            plan = app.generate_search_plan(profile, "qwen", ["zhaopin"])
+
+        queries = [query for group in plan["groups"] for query in group["queries"]]
+        self.assertIn("数据运营", queries)
+        self.assertIn("运营助理", queries)
+        self.assertNotIn("行政助理", queries)
+        self.assertNotIn("数据录入员", queries)
+        self.assertNotIn("客服专员", queries)
+        self.assertIn("已自动校正", plan["warning"])
 
     def test_radar_only_sends_top_sixty_jobs_to_ai(self):
         jobs = [make_job(index, title=f"环境工程师 {index}") for index in range(80)]
@@ -224,6 +271,54 @@ class ExtensionSessionTests(unittest.TestCase):
         result = app.block_radar_task(session_id, "radar-not-current", "过期任务")
         self.assertEqual(result["status"], "running")
 
+    def test_radar_queues_and_records_detail_review(self):
+        session_id = "capture_radardetail1"
+        profile = {
+            "city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"],
+            "education": "本科",
+        }
+        plan = {
+            "groups": [{"tier": "exact", "label": "精准岗位", "queries": ["环境工程"]}],
+            "tasks": [{
+                "id": "radar-search-one", "type": "search", "platform": "zhaopin",
+                "platformLabel": "智联招聘", "tier": "exact", "tierLabel": "精准岗位",
+                "query": "环境工程", "url": "https://sou.zhaopin.com/?kw=test", "status": "pending",
+            }],
+        }
+        radar = app.start_radar_session(session_id, plan, profile)
+        job = make_job(1, url="https://www.zhaopin.com/jobdetail/test-one.htm", detailStatus="list")
+        updated = app.radar_record_batch(session_id, radar["currentTask"]["id"], {"jobs": [job]})
+        self.assertEqual(updated["status"], "running")
+        self.assertEqual(updated["currentTask"]["type"], "detail")
+        self.assertEqual(updated["detailTotal"], 1)
+
+        finished = app.radar_record_batch(session_id, updated["currentTask"]["id"], {
+            "detail": {"description": "岗位职责与任职要求：" + "环境监测与报告编制。" * 12, "tags": ["报告编制"]},
+            "jobs": [],
+        })
+        pool, _ = app.radar_job_pool(session_id)
+        self.assertEqual(finished["status"], "ready")
+        self.assertEqual(pool[0]["detailStatus"], "detail")
+        self.assertIn("报告编制", pool[0]["tags"])
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_store_retries_windows_replace_failure(self):
+        real_replace = app.os.replace
+        attempts = {"count": 0}
+
+        def flaky_replace(source, destination):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise PermissionError("temporary scanner lock")
+            return real_replace(source, destination)
+
+        with patch.object(app.os, "replace", side_effect=flaky_replace), \
+                patch.object(app.time, "sleep") as fake_sleep:
+            self.assertTrue(app._save_radar_store())
+        self.assertEqual(attempts["count"], 2)
+        fake_sleep.assert_called_once()
+
 
 class HostValidationTests(unittest.TestCase):
     def test_host_header_allowed(self):
@@ -244,6 +339,27 @@ class HostValidationTests(unittest.TestCase):
 
 
 class LlmRetryTests(unittest.TestCase):
+    def test_call_llm_rejects_truncated_response(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {"content": "{\"matches\":["},
+                        "finish_reason": "length",
+                    }]
+                }).encode("utf-8")
+
+        with patch.object(app.urllib.request, "urlopen", return_value=FakeResponse()):
+            with patch.dict(app.os.environ, {app.PROVIDERS["qwen"]["keyEnv"]: "test-key"}):
+                with self.assertRaisesRegex(ValueError, "被截断"):
+                    app.call_llm("qwen", [{"role": "user", "content": "unique-truncated-test"}])
+
     def test_call_llm_retries_transient_error_then_succeeds(self):
         calls = {"count": 0}
 

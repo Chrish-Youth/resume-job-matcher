@@ -134,7 +134,8 @@
             <label class="schedule-toggle"><input id="scheduleEnabled" type="checkbox"><span>每天自动跑一轮，发现新岗位会通知</span></label>
             <button class="secondary-button" id="saveSchedule" type="button">保存定时设置</button>
           </div>
-          <p class="schedule-hint">开启后，只要浏览器在你设定的时间处于运行状态，就会自动采集并匹配新岗位；完成后扩展会发桌面通知。</p>
+          <p class="schedule-hint">开启后，本地助手与浏览器在设定时间运行时会自动采集；若本地助手暂时关闭，恢复连接后扩展会自动补跑。</p>
+          <p class="schedule-meta" id="scheduleMeta">本地助手和浏览器都需要保持运行；若服务短暂关闭，恢复后会自动补跑。</p>
         </details>
         <div class="scheduled-result hidden" id="scheduledResult" role="status">
           <b id="scheduledResultTitle">定时雷达有新结果</b>
@@ -177,7 +178,8 @@
         <div class="result-tabs" id="resultTabs" aria-label="岗位分组">
           <button class="active" data-view="all" type="button">全部 <span id="allJobCount">0</span></button>
           <button data-view="strong" type="button">重点推荐 <span id="strongJobCount">0</span></button>
-          <button data-view="transferable" type="button">可迁移 <span id="transferJobCount">0</span></button>
+          <button data-view="transferable" type="button">值得尝试 <span id="transferJobCount">0</span></button>
+          <button data-view="saved" type="button">已收藏 <span id="savedJobCount">0</span></button>
           <button data-view="new" type="button">本轮新增 <span id="newJobCount">0</span></button>
         </div>
         <div class="job-list" id="jobList"></div>
@@ -290,6 +292,22 @@
         <button class="primary-button copy-button" id="copyGreeting" type="button">复制招呼语</button>
       </div>
       <p class="platform-note" id="platformNote">可粘贴到招聘平台的沟通对话框中</p>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="feedbackModal" role="dialog" aria-modal="true" aria-labelledby="feedbackModalTitle">
+    <div class="modal feedback-modal">
+      <button class="modal-close" id="feedbackModalClose" type="button" aria-label="关闭">×</button>
+      <div class="modal-kicker">帮助下轮推荐更准确</div>
+      <h2 id="feedbackModalTitle">这个岗位哪里不合适？</h2>
+      <p class="modal-subtitle" id="feedbackJobTitle">选择一个主要原因，系统会减少类似岗位。</p>
+      <div class="feedback-reasons" id="feedbackReasons">
+        <button type="button" data-reason="方向不符">方向不符</button>
+        <button type="button" data-reason="薪资偏低">薪资偏低</button>
+        <button type="button" data-reason="地点不合适">地点不合适</button>
+        <button type="button" data-reason="经验要求高">经验要求高</button>
+        <button type="button" data-reason="公司不考虑">公司不考虑</button>
+      </div>
     </div>
   </div>
 

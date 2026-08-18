@@ -55,6 +55,9 @@ SCHEDULE_CONFIG: dict = {
     "profile": None,
     "provider": None,
     "updatedAt": 0,
+    "lastAttemptAt": 0,
+    "lastStartedAt": 0,
+    "lastError": None,
 }
 LAST_SCHEDULED: dict = {
     "profile": None,
@@ -63,6 +66,9 @@ LAST_SCHEDULED: dict = {
     "engine": None,
     "summary": None,
 }
+JOB_FEEDBACK: dict[str, dict] = {}
+STORE_STATUS: dict = {"ok": True, "error": None, "savedAt": 0}
+RADAR_DETAIL_LIMIT = 12
 
 
 def _load_radar_store() -> None:
@@ -86,22 +92,84 @@ def _load_radar_store() -> None:
     last = payload.get("lastScheduled")
     if isinstance(last, dict):
         LAST_SCHEDULED.update(last)
+    feedback = payload.get("feedback")
+    if isinstance(feedback, dict):
+        JOB_FEEDBACK.clear()
+        JOB_FEEDBACK.update({
+            str(key)[:160]: value
+            for key, value in feedback.items()
+            if isinstance(value, dict)
+        })
 
 
-def _save_radar_store() -> None:
+def _save_radar_store() -> bool:
     payload = {
         "activeSession": ACTIVE_EXTENSION_SESSION,
         "schedule": SCHEDULE_CONFIG,
         "sessions": EXTENSION_SESSIONS,
         "lastScheduled": LAST_SCHEDULED,
+        "feedback": JOB_FEEDBACK,
     }
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = RADAR_STORE_PATH.with_name(
+        f"{RADAR_STORE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_error: OSError | None = None
+    for attempt in range(3):
+        try:
+            with temp_path.open("wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, RADAR_STORE_PATH)
+            STORE_STATUS.update({"ok": True, "error": None, "savedAt": int(time.time())})
+            return True
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.08 * (attempt + 1))
     try:
-        DATA_DIR.mkdir(exist_ok=True)
-        temp_path = RADAR_STORE_PATH.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(RADAR_STORE_PATH)
-    except OSError as exc:
-        print(f"雷达数据持久化失败：{exc}", file=sys.stderr)
+        temp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    message = str(last_error or "未知写入错误")
+    STORE_STATUS.update({"ok": False, "error": message, "savedAt": int(time.time())})
+    print(f"雷达数据持久化失败：{message}", file=sys.stderr)
+    return False
+
+
+def clear_local_data() -> bool:
+    """清除浏览器之外由本地服务保存的画像、雷达结果和岗位反馈。"""
+    global ACTIVE_EXTENSION_SESSION
+    with EXTENSION_INBOX_LOCK:
+        EXTENSION_SESSIONS.clear()
+        ACTIVE_EXTENSION_SESSION = None
+        SCHEDULE_CONFIG.clear()
+        SCHEDULE_CONFIG.update({
+            "enabled": False,
+            "hour": 9,
+            "minute": 0,
+            "platforms": ["zhaopin", "boss"],
+            "profile": None,
+            "provider": None,
+            "updatedAt": int(time.time()),
+            "lastAttemptAt": 0,
+            "lastStartedAt": 0,
+            "lastError": None,
+        })
+        LAST_SCHEDULED.clear()
+        LAST_SCHEDULED.update({
+            "profile": None, "jobs": [], "ids": [], "engine": None, "summary": None,
+        })
+        JOB_FEEDBACK.clear()
+        try:
+            RADAR_STORE_PATH.unlink(missing_ok=True)
+        except OSError as exc:
+            STORE_STATUS.update({"ok": False, "error": str(exc), "savedAt": int(time.time())})
+            return False
+        STORE_STATUS.update({"ok": True, "error": None, "savedAt": int(time.time())})
+        return True
 
 
 _load_radar_store()
@@ -428,28 +496,41 @@ def extract_pdf(data: bytes) -> str:
             raise ValueError("PDF 页数超过 60 页，请只上传求职简历。")
         text = "\n".join((page.extract_text() or "") for page in reader.pages)
     except ImportError:
-        bundled_python = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe"
-        helper = ROOT / "pdf_extract.py"
-        if not bundled_python.is_file() or not helper.is_file():
-            raise ValueError("当前环境缺少 PDF 解析组件，请通过“启动.ps1”启动应用后重试。")
-        process = subprocess.run(
-            [str(bundled_python), str(helper)], input=data, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=45, check=False,
-        )
-        if process.returncode != 0:
-            detail = process.stderr.decode("utf-8", errors="replace").strip()
-            raise ValueError(detail or "PDF 解析失败，请重新导出后上传。")
-        text = process.stdout.decode("utf-8", errors="replace")
+        text = ""
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError("PDF 结构异常或已损坏，请重新导出后上传。") from exc
 
+    if len(re.sub(r"\s+", "", text)) < 30:
+        helper = ROOT / "pdf_extract.py"
+        bundled_python = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe"
+        candidates = [path for path in (bundled_python, Path(sys.executable)) if path.is_file()]
+        errors = []
+        for python_path in dict.fromkeys(candidates):
+            try:
+                process = subprocess.run(
+                    [str(python_path), str(helper)], input=data, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, timeout=120, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                errors.append(str(exc))
+                continue
+            if process.returncode == 0:
+                text = process.stdout.decode("utf-8", errors="replace")
+                break
+            detail = process.stderr.decode("utf-8", errors="replace").strip()
+            if detail:
+                errors.append(detail)
+        if len(re.sub(r"\s+", "", text)) < 30:
+            raise ValueError(errors[-1] if errors else "当前环境缺少 PDF 解析或 OCR 组件，请按 README 安装后重试。")
+
     text = unicodedata.normalize("NFKC", text).replace("\x00", "")
     text = re.sub(r"[\u200b-\u200d\ufeff]", "", text)
     text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     if len(re.sub(r"\s+", "", text)) < 30:
-        raise ValueError("没有从 PDF 中识别到足够文字。该文件可能是扫描件，请导出为可复制文字的 PDF，或上传 DOCX/TXT 版本。")
+        raise ValueError("没有从 PDF 中识别到足够文字，请上传更清晰的扫描件或文字版 PDF。")
     return text
 
 
@@ -551,6 +632,96 @@ def compact_profile_for_llm(profile: dict, *, include_name: bool = False) -> dic
     return compact
 
 
+def job_feedback_key(job: dict) -> str:
+    identity = "|".join([
+        str(job.get("title", "")).strip().lower(),
+        str(job.get("company", "")).strip().lower(),
+        str(job.get("location", "")).strip().lower(),
+    ])
+    if identity != "||":
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return str(job.get("id", ""))[:80]
+
+
+def normalize_feedback_entry(job: dict, status: object, reason: object = "") -> tuple[str, dict]:
+    allowed = {"saved", "dismissed", "contacted", "applied"}
+    clean_status = str(status or "").strip().lower()
+    if clean_status not in allowed:
+        raise ValueError("岗位反馈状态不正确。")
+    key = job_feedback_key(job)
+    if not key:
+        raise ValueError("岗位信息不完整，无法保存反馈。")
+    tags = [str(item).strip()[:30] for item in job.get("tags", []) if str(item).strip()]
+    entry = {
+        "status": clean_status,
+        "reason": str(reason or "").strip()[:40],
+        "title": str(job.get("title", "")).strip()[:80],
+        "company": str(job.get("company", "")).strip()[:100],
+        "location": str(job.get("location", "")).strip()[:80],
+        "tags": tags[:8],
+        "updatedAt": int(time.time()),
+    }
+    return key, entry
+
+
+def feedback_for_profile(limit: int = 80) -> list[dict]:
+    entries = sorted(
+        JOB_FEEDBACK.values(),
+        key=lambda item: int(item.get("updatedAt", 0)),
+        reverse=True,
+    )
+    return [dict(item) for item in entries[:limit]]
+
+
+def feedback_adjustment(profile: dict, job: dict) -> tuple[int, list[str]]:
+    feedback = profile.get("feedback")
+    if not isinstance(feedback, list):
+        return 0, []
+    title = str(job.get("title", "")).lower()
+    company = str(job.get("company", "")).lower()
+    job_tags = {str(item).lower() for item in job.get("tags", [])}
+    adjustment = 0
+    reasons: list[str] = []
+    for item in feedback[-80:]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", ""))
+        old_title = str(item.get("title", "")).lower()
+        old_company = str(item.get("company", "")).lower()
+        old_tags = {str(tag).lower() for tag in item.get("tags", [])}
+        title_related = bool(old_title and (old_title in title or title in old_title))
+        tag_related = len(job_tags & old_tags) >= 2
+        if not title_related and not tag_related:
+            continue
+        if status in {"saved", "contacted", "applied"}:
+            adjustment += 4 if title_related else 2
+            if "参考了你之前感兴趣的相似岗位" not in reasons:
+                reasons.append("参考了你之前感兴趣的相似岗位")
+        elif status == "dismissed":
+            reason = str(item.get("reason", ""))
+            if reason == "公司不考虑" and old_company and old_company == company:
+                adjustment -= 18
+            elif reason in {"方向不符", "经验要求高"}:
+                adjustment -= 6 if title_related else 3
+    return max(-20, min(adjustment, 10)), reasons
+
+
+def job_evidence_metadata(job: dict) -> dict:
+    detailed = str(job.get("detailStatus", "")).lower() == "detail"
+    description = re.sub(r"\s+", " ", str(job.get("description", ""))).strip()
+    tag_count = len([item for item in job.get("tags", []) if str(item).strip()])
+    if detailed and len(description) >= 180:
+        return {"evidenceLevel": "detail", "evidenceLabel": "岗位详情已复核", "scoreCap": 97}
+    if len(description) >= 180 and tag_count >= 3:
+        return {"evidenceLevel": "summary", "evidenceLabel": "列表信息较完整", "scoreCap": 85}
+    return {"evidenceLevel": "limited", "evidenceLabel": "信息有限，建议核对", "scoreCap": 81}
+
+
+def apply_evidence_score_cap(job: dict, score: int) -> tuple[int, dict]:
+    evidence = job_evidence_metadata(job)
+    return min(int(score), int(evidence["scoreCap"])), evidence
+
+
 def clean_search_query(value: object) -> str:
     query = re.sub(r"\s+", " ", str(value or "")).strip(" ，,、/|")
     query = re.sub(r"(相关岗位|求职方向|方向|岗位)$", "", query).strip()
@@ -600,6 +771,84 @@ def normalize_search_groups(raw_groups: object, fallback: list[dict] | None = No
     return groups
 
 
+SEARCH_GENERIC_TERMS = {
+    "助理", "专员", "经理", "主管", "顾问", "工程师", "实习生", "管培生",
+    "岗位", "方向", "相关", "项目", "管理", "服务",
+}
+SEARCH_OFF_DIRECTION_TERMS = {
+    "行政", "文员", "录入", "客服", "销售", "人事", "财务", "档案", "电话", "标注",
+}
+
+
+def search_semantic_terms(values: list[object]) -> set[str]:
+    """提取职位方向词，供大模型搜索词的语义护栏使用。"""
+    terms: set[str] = set()
+    for value in values:
+        text = str(value or "").lower().strip()
+        if not text:
+            continue
+        for token in re.findall(r"[a-z][a-z0-9+#.]{1,}|[\u4e00-\u9fff]+", text):
+            if token in SEARCH_GENERIC_TERMS:
+                continue
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                if len(token) >= 2:
+                    terms.add(token)
+                for index in range(max(0, len(token) - 1)):
+                    gram = token[index:index + 2]
+                    if gram not in SEARCH_GENERIC_TERMS:
+                        terms.add(gram)
+            else:
+                terms.add(token)
+    return terms
+
+
+def filter_search_groups_for_profile(
+    profile: dict,
+    raw_groups: object,
+    fallback: list[dict],
+) -> tuple[list[dict], int]:
+    """拒绝明显偏离画像的模型搜索词，避免错误模型输出直接触发无关抓取。"""
+    profile_values: list[object] = [
+        profile.get("target"),
+        profile.get("searchKeyword"),
+        *(profile.get("skills") if isinstance(profile.get("skills"), list) else []),
+    ]
+    fallback_values = [
+        query
+        for group in fallback
+        for query in (group.get("queries", []) if isinstance(group, dict) else [])
+    ]
+    anchor_terms = search_semantic_terms(profile_values + fallback_values)
+    profile_text = " ".join(str(value or "").lower() for value in profile_values)
+    source = raw_groups if isinstance(raw_groups, list) else []
+    filtered: list[dict] = []
+    rejected = 0
+    for group in source:
+        if not isinstance(group, dict):
+            continue
+        tier = str(group.get("tier", "")).strip().lower()
+        if tier not in SEARCH_TIER_LABELS or not isinstance(group.get("queries"), list):
+            continue
+        queries: list[str] = []
+        for item in group["queries"]:
+            query = clean_search_query(item)
+            if not query:
+                continue
+            lowered = query.lower()
+            has_unjustified_direction = any(
+                term in lowered and term not in profile_text
+                for term in SEARCH_OFF_DIRECTION_TERMS
+            )
+            query_terms = search_semantic_terms([query])
+            if has_unjustified_direction or not (query_terms & anchor_terms):
+                rejected += 1
+                continue
+            queries.append(query)
+        if queries:
+            filtered.append({"tier": tier, "queries": queries})
+    return filtered, rejected
+
+
 def local_search_groups(profile: dict) -> list[dict]:
     keyword = clean_search_query(profile.get("searchKeyword"))
     profile_text = " ".join([
@@ -622,6 +871,23 @@ def local_search_groups(profile: dict) -> list[dict]:
         exact = ([keyword] if keyword else []) + list(selected["exact"])
         adjacent = list(selected["adjacent"])
         transferable = list(selected["transferable"])
+    feedback = profile.get("feedback")
+    if isinstance(feedback, list):
+        liked_titles = []
+        disliked_titles = set()
+        for item in feedback[-80:]:
+            if not isinstance(item, dict):
+                continue
+            title = clean_search_query(item.get("title"))
+            if not title:
+                continue
+            if item.get("status") in {"saved", "contacted", "applied"}:
+                liked_titles.append(title)
+            elif item.get("status") == "dismissed" and item.get("reason") == "方向不符":
+                disliked_titles.add(title.lower())
+        exact = liked_titles[-2:] + [item for item in exact if item.lower() not in disliked_titles]
+        adjacent = [item for item in adjacent if item.lower() not in disliked_titles]
+        transferable = [item for item in transferable if item.lower() not in disliked_titles]
     return normalize_search_groups([
         {"tier": "exact", "queries": exact},
         {"tier": "adjacent", "queries": adjacent},
@@ -661,6 +927,7 @@ def build_search_plan(
                 digest = hashlib.sha256(f"{platform}|{city}|{tier}|{query}".encode("utf-8")).hexdigest()[:12]
                 tasks.append({
                     "id": f"radar-{digest}",
+                    "type": "search",
                     "platform": platform,
                     "platformLabel": "智联招聘" if platform == "zhaopin" else "BOSS直聘",
                     "tier": tier,
@@ -704,8 +971,16 @@ def generate_search_plan(profile: dict, provider_id: str | None, platforms: list
             max_tokens=900,
         )
         result = parse_json_response(raw)
-        groups = normalize_search_groups(result.get("groups"), fallback)
-        return build_search_plan(profile, groups, platforms, engine="ai")
+        filtered_groups, rejected = filter_search_groups_for_profile(
+            profile,
+            result.get("groups"),
+            fallback,
+        )
+        groups = normalize_search_groups(filtered_groups, fallback)
+        warning = None
+        if rejected:
+            warning = f"大模型给出的 {rejected} 个搜索词与简历方向偏离，已自动校正。"
+        return build_search_plan(profile, groups, platforms, engine="ai", warning=warning)
     except ValueError as exc:
         return build_search_plan(
             profile,
@@ -796,8 +1071,11 @@ def score_job(profile: dict, job: dict) -> dict:
         base += 3
     if profile.get("education") in {"本科", "硕士", "博士"}:
         base += 2
-    score = max(28, min(base, 95))
-    reasons = [f"简历中的「{item}」与岗位要求一致" for item in overlaps[:2]]
+    feedback_delta, feedback_reasons = feedback_adjustment(profile, job)
+    base += feedback_delta
+    score, evidence = apply_evidence_score_cap(job, max(28, min(base, 95)))
+    reasons = list(feedback_reasons)
+    reasons.extend(f"简历中的「{item}」与岗位要求一致" for item in overlaps[:2])
     if direction_hits:
         reasons.append("岗位方向与当前求职目标一致")
     if search_tier in SEARCH_TIER_LABELS:
@@ -815,6 +1093,7 @@ def score_job(profile: dict, job: dict) -> dict:
         "reasons": reasons[:3],
         "gaps": gaps,
         "matchEngine": "local",
+        **evidence,
     }
 
 
@@ -1146,9 +1425,15 @@ def call_llm(
                 raise ValueError(f"无法连接 {config['label']}（{exc.reason}），请检查网络或接口地址。") from exc
             time.sleep(LLM_RETRY_BACKOFF_SECONDS * attempt)
     try:
-        content = result["choices"][0]["message"]["content"]
+        choice = result["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"{config['label']} 返回了无法识别的数据。") from exc
+    finish_reason = str(choice.get("finish_reason") or "").lower()
+    if finish_reason == "length":
+        raise ValueError(f"{config['label']} 返回内容被截断，请稍后重试。")
+    if finish_reason and finish_reason not in {"stop", "tool_calls"}:
+        raise ValueError(f"{config['label']} 未能正常完成生成（{finish_reason}）。")
     if not isinstance(content, str) or not content.strip():
         raise ValueError(f"{config['label']} 未返回有效内容。")
     content = content.strip()
@@ -1252,6 +1537,7 @@ def llm_analyze_and_match(text: str, filename: str, provider_id: str) -> tuple[d
             score = max(0, min(int(score), 100))
         except (TypeError, ValueError):
             score = fallback["score"]
+        score, evidence = apply_evidence_score_cap(job, score)
         tags = ai_match.get("matchedTags")
         reasons = ai_match.get("reasons")
         gaps = ai_match.get("gaps")
@@ -1263,6 +1549,7 @@ def llm_analyze_and_match(text: str, filename: str, provider_id: str) -> tuple[d
             "reasons": [str(x)[:100] for x in reasons[:3]] if isinstance(reasons, list) else fallback["reasons"],
             "gaps": [str(x)[:60] for x in gaps[:2]] if isinstance(gaps, list) else fallback["gaps"],
             "matchEngine": "ai" if ai_match else "local",
+            **evidence,
         })
     return profile, sorted(matched_jobs, key=lambda item: item["score"], reverse=True)
 
@@ -1347,6 +1634,7 @@ def llm_match_jobs(profile: dict, jobs: list[dict], provider_id: str) -> tuple[l
             score = max(0, min(int(ai_match.get("score", fallback["score"])), 100))
         except (TypeError, ValueError):
             score = fallback["score"]
+        score, evidence = apply_evidence_score_cap(job, score)
         tags = ai_match.get("matchedTags")
         reasons = ai_match.get("reasons")
         gaps = ai_match.get("gaps")
@@ -1358,6 +1646,7 @@ def llm_match_jobs(profile: dict, jobs: list[dict], provider_id: str) -> tuple[l
             "reasons": [str(x)[:100] for x in reasons[:3]] if isinstance(reasons, list) else fallback["reasons"],
             "gaps": [str(x)[:60] for x in gaps[:2]] if isinstance(gaps, list) else fallback["gaps"],
             "matchEngine": "ai" if ai_match else "local",
+            **evidence,
         })
     warning = None
     if errors:
@@ -1560,11 +1849,12 @@ def sanitize_job_payload(value: object) -> dict | None:
         "logo": str(value.get("logo", "JOB"))[:6],
         "logoColor": str(value.get("logoColor", "#1f6b45"))[:20],
         "tags": [str(x)[:30] for x in value.get("tags", [])[:10]] if isinstance(value.get("tags"), list) else [],
-        "description": str(value.get("description", ""))[:500],
+        "description": str(value.get("description", ""))[:6000],
         "highlights": [],
         "posted": str(value.get("posted", "公开职位"))[:30],
         "url": job_url,
         "source": source,
+        "detailStatus": "detail" if value.get("detailStatus") == "detail" else "list",
     }
 
 
@@ -1618,6 +1908,7 @@ def normalize_extension_jobs(raw_jobs: object, platform_key: str, platform_label
         job["source"] = f"{platform_label}浏览器扩展"
         job["posted"] = str(raw.get("posted") or "扩展采集")[:30]
         job["capturedAt"] = int(time.time())
+        job["detailStatus"] = "list"
         output.append(job)
     if not output:
         raise ValueError("当前页面没有识别到完整职位卡片，请确认已打开职位搜索结果页并加载出岗位。")
@@ -1716,6 +2007,8 @@ def radar_public_state(radar: dict | None) -> dict:
         "tasks": tasks,
         "warning": radar.get("warning"),
         "startedAt": radar.get("startedAt"),
+        "detailTotal": int(radar.get("detailTotal", 0)),
+        "detailCompleted": int(radar.get("detailCompleted", 0)),
     }
     if radar.get("blockedReason"):
         public["blockedReason"] = radar["blockedReason"]
@@ -1723,7 +2016,14 @@ def radar_public_state(radar: dict | None) -> dict:
     return public
 
 
-def start_radar_session(session_id: str, plan: dict) -> dict:
+def start_radar_session(
+    session_id: str,
+    plan: dict,
+    profile: dict | None = None,
+    provider: str | None = None,
+    *,
+    auto_finalize: bool = False,
+) -> dict:
     activate_extension_session(session_id, "radar")
     now = time.time()
     with EXTENSION_INBOX_LOCK:
@@ -1731,6 +2031,10 @@ def start_radar_session(session_id: str, plan: dict) -> dict:
         session["batches"] = []
         session["sequence"] = 0
         session["jobPool"] = []
+        if isinstance(profile, dict):
+            session["profile"] = profile
+        session["provider"] = provider
+        session["autoFinalize"] = auto_finalize
         session["radar"] = {
             "status": "running",
             "groups": plan.get("groups", []),
@@ -1741,10 +2045,59 @@ def start_radar_session(session_id: str, plan: dict) -> dict:
             "duplicates": 0,
             "warning": plan.get("warning"),
             "startedAt": int(now),
+            "detailPrepared": False,
+            "detailCompleted": 0,
         }
         session["updatedAt"] = now
         _save_radar_store()
         return radar_public_state(session["radar"])
+
+
+def prepare_radar_detail_tasks(session: dict, radar: dict) -> int:
+    if radar.get("detailPrepared"):
+        return 0
+    radar["detailPrepared"] = True
+    pool = session.get("jobPool")
+    profile = session.get("profile")
+    if not isinstance(pool, list) or not isinstance(profile, dict):
+        return 0
+    ranked = sorted(
+        (score_job(profile, job) for job in pool if isinstance(job, dict)),
+        key=lambda item: item.get("score", 0),
+        reverse=True,
+    )
+    tasks = radar.get("tasks")
+    if not isinstance(tasks, list):
+        return 0
+    seen_urls: set[str] = set()
+    detail_tasks = []
+    for job in ranked:
+        url = str(job.get("url", "")).strip()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        platform = "boss" if host == "zhipin.com" or host.endswith(".zhipin.com") else "zhaopin" if host == "zhaopin.com" or host.endswith(".zhaopin.com") else ""
+        normalized_url = url.split("#", 1)[0]
+        if not platform or not normalized_url or normalized_url in seen_urls:
+            continue
+        seen_urls.add(normalized_url)
+        digest = hashlib.sha256(f"detail|{job.get('id')}|{normalized_url}".encode("utf-8")).hexdigest()[:12]
+        detail_tasks.append({
+            "id": f"detail-{digest}",
+            "type": "detail",
+            "platform": platform,
+            "platformLabel": "BOSS直聘" if platform == "boss" else "智联招聘",
+            "tier": job.get("searchTier", "exact"),
+            "tierLabel": "岗位详情复核",
+            "query": str(job.get("title", "岗位详情"))[:60],
+            "jobId": job.get("id"),
+            "url": normalized_url,
+            "status": "pending",
+        })
+        if len(detail_tasks) >= RADAR_DETAIL_LIMIT:
+            break
+    tasks.extend(detail_tasks)
+    radar["detailTotal"] = len(detail_tasks)
+    return len(detail_tasks)
 
 
 def active_radar_state() -> tuple[str | None, dict]:
@@ -1783,6 +2136,37 @@ def radar_record_batch(session_id: str, task_id: str, batch: dict) -> dict:
         if not isinstance(pool, list):
             pool = []
             session["jobPool"] = pool
+        if current.get("type") == "detail":
+            detail = batch.get("detail")
+            if isinstance(detail, dict):
+                target_id = str(current.get("jobId", ""))
+                for job in pool:
+                    if not isinstance(job, dict) or str(job.get("id", "")) != target_id:
+                        continue
+                    description = re.sub(r"\s+", " ", str(detail.get("description", ""))).strip()[:6000]
+                    detail_tags = [str(item).strip()[:30] for item in detail.get("tags", []) if str(item).strip()]
+                    if len(description) >= 120:
+                        job["description"] = description
+                        job["detailStatus"] = "detail"
+                    if detail_tags:
+                        job["tags"] = list(dict.fromkeys([*job.get("tags", []), *detail_tags]))[:12]
+                    for field in ("education", "experience"):
+                        value = str(detail.get(field, "")).strip()
+                        if value:
+                            job[field] = value[:40]
+                    break
+            current["status"] = "completed"
+            current["collected"] = 0
+            current["unique"] = 0
+            radar["detailCompleted"] = int(radar.get("detailCompleted", 0)) + 1
+            radar["cursor"] = cursor + 1
+            if radar["cursor"] >= len(tasks):
+                radar["status"] = "ready"
+            session["updatedAt"] = now
+            _save_radar_store()
+            if session.get("autoFinalize") is True and radar["status"] == "ready":
+                maybe_auto_finalize_scheduled(session_id)
+            return radar_public_state(radar)
         existing = {
             f"{job.get('title', '').lower()}|{job.get('company', '').lower()}|{job.get('location', '').lower()}": index
             for index, job in enumerate(pool) if isinstance(job, dict)
@@ -1816,7 +2200,9 @@ def radar_record_batch(session_id: str, task_id: str, batch: dict) -> dict:
         radar["duplicates"] = int(radar.get("collected", 0)) - len(pool)
         radar["cursor"] = cursor + 1
         if radar["cursor"] >= len(tasks):
-            radar["status"] = "ready"
+            added_details = prepare_radar_detail_tasks(session, radar)
+            if not added_details:
+                radar["status"] = "ready"
         session["updatedAt"] = now
         _save_radar_store()
         if session.get("autoFinalize") is True and radar["status"] == "ready":
@@ -1932,12 +2318,19 @@ def public_schedule() -> dict:
         "minute": int(SCHEDULE_CONFIG.get("minute", 0)),
         "platforms": [str(item) for item in SCHEDULE_CONFIG.get("platforms", ["zhaopin", "boss"])],
         "updatedAt": SCHEDULE_CONFIG.get("updatedAt", 0),
+        "lastAttemptAt": SCHEDULE_CONFIG.get("lastAttemptAt", 0),
+        "lastStartedAt": SCHEDULE_CONFIG.get("lastStartedAt", 0),
+        "lastError": SCHEDULE_CONFIG.get("lastError"),
+        "storage": dict(STORE_STATUS),
     }
 
 
 def start_scheduled_radar() -> tuple[str, dict]:
     with EXTENSION_INBOX_LOCK:
         schedule = SCHEDULE_CONFIG
+        schedule["lastAttemptAt"] = int(time.time())
+        schedule["lastError"] = None
+        _save_radar_store()
         profile = schedule.get("profile")
         if not schedule.get("enabled") or not isinstance(profile, dict):
             raise ValueError("尚未设置定时雷达或缺少简历画像。")
@@ -1955,12 +2348,16 @@ def start_scheduled_radar() -> tuple[str, dict]:
     if not plan.get("tasks"):
         raise ValueError("没有生成有效的搜索计划。")
     session_id = f"sched_{secrets.token_hex(8)}"
-    radar = start_radar_session(session_id, plan)
+    radar = start_radar_session(
+        session_id,
+        plan,
+        profile,
+        schedule.get("provider"),
+        auto_finalize=True,
+    )
     with EXTENSION_INBOX_LOCK:
-        session = EXTENSION_SESSIONS[session_id]
-        session["profile"] = profile
-        session["provider"] = schedule.get("provider")
-        session["autoFinalize"] = True
+        SCHEDULE_CONFIG["lastStartedAt"] = int(time.time())
+        SCHEDULE_CONFIG["lastError"] = None
         _save_radar_store()
     return session_id, radar
 
@@ -1989,7 +2386,7 @@ def _auto_finalize_scheduled_worker(session_id: str) -> None:
                 return
         jobs, radar_state = radar_job_pool(session_id)
         if not jobs:
-            return
+            raise ValueError("本轮没有采集到可用岗位，请检查招聘页面、登录状态或筛选条件。")
         ranked, excluded_count, warning = finalize_radar_jobs(profile, jobs, provider_id)
         previous_ids = set(LAST_SCHEDULED.get("ids", []))
         current_ids = [str(job["id"]) for job in ranked if job.get("id")]
@@ -2016,8 +2413,17 @@ def _auto_finalize_scheduled_worker(session_id: str) -> None:
             LAST_SCHEDULED["ids"] = current_ids
             LAST_SCHEDULED["engine"] = engine_info(provider_id, warning)
             LAST_SCHEDULED["summary"] = summary
+            SCHEDULE_CONFIG["lastError"] = None
             _save_radar_store()
     except Exception as exc:
+        with EXTENSION_INBOX_LOCK:
+            SCHEDULE_CONFIG["lastError"] = str(exc)[:200]
+            session = EXTENSION_SESSIONS.get(session_id)
+            radar = session.get("radar") if isinstance(session, dict) else None
+            if isinstance(radar, dict):
+                radar["status"] = "error"
+                radar["error"] = str(exc)[:200]
+            _save_radar_store()
         print(f"定时雷达自动整理失败：{exc}", file=sys.stderr)
 
 
@@ -2098,6 +2504,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/jobs":
             self.send_json(JOBS)
+            return
+        if path == "/api/feedback":
+            self.send_json({"feedback": JOB_FEEDBACK, "count": len(JOB_FEEDBACK)})
             return
         if path == "/api/radar/active":
             if not self.extension_origin_allowed():
@@ -2188,6 +2597,29 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "文件超过 8MB，请压缩后重试。"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 return
             body = self.rfile.read(length)
+            if path == "/api/local-data/clear":
+                if not clear_local_data():
+                    raise ValueError(f"本机数据清理失败：{STORE_STATUS.get('error') or '文件被占用'}")
+                self.send_json({"ok": True})
+                return
+            if path == "/api/feedback":
+                payload = json.loads(body.decode("utf-8"))
+                job = sanitize_job_payload(payload.get("job"))
+                if not job:
+                    raise ValueError("岗位信息不完整，无法保存反馈。")
+                status = str(payload.get("status", "")).strip().lower()
+                key = job_feedback_key(job)
+                with EXTENSION_INBOX_LOCK:
+                    if status == "none":
+                        JOB_FEEDBACK.pop(key, None)
+                        entry = None
+                    else:
+                        key, entry = normalize_feedback_entry(job, status, payload.get("reason"))
+                        JOB_FEEDBACK[key] = entry
+                    if not _save_radar_store():
+                        raise ValueError(f"反馈未能保存：{STORE_STATUS.get('error') or '本机文件写入失败'}")
+                self.send_json({"ok": True, "key": key, "feedback": entry})
+                return
             if path == "/api/radar/start":
                 if not self.extension_origin_allowed():
                     self.send_json({"error": "只接受本机助手创建岗位雷达。"}, HTTPStatus.FORBIDDEN)
@@ -2203,7 +2635,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 plan = generate_search_plan(profile, provider_id, [str(item) for item in platforms])
                 if not plan.get("tasks"):
                     raise ValueError("没有生成有效的搜索计划，请补充求职方向后重试。")
-                radar = start_radar_session(session_id, plan)
+                radar = start_radar_session(session_id, plan, profile, provider_id)
                 self.send_json({
                     "ok": True,
                     "sessionId": session_id,
@@ -2242,14 +2674,21 @@ class AppHandler(BaseHTTPRequestHandler):
                         "provider": resolve_provider(payload.get("provider")),
                         "updatedAt": int(time.time()),
                     })
-                    _save_radar_store()
+                    if not _save_radar_store():
+                        raise ValueError(f"定时设置未能保存：{STORE_STATUS.get('error') or '本机文件写入失败'}")
                 self.send_json({"ok": True, "schedule": public_schedule()})
                 return
             if path == "/api/radar/scheduled/start":
                 if not self.extension_origin_allowed():
                     self.send_json({"error": "只接受本机岗位采集扩展启动定时雷达。"}, HTTPStatus.FORBIDDEN)
                     return
-                session_id, radar = start_scheduled_radar()
+                try:
+                    session_id, radar = start_scheduled_radar()
+                except Exception as exc:
+                    with EXTENSION_INBOX_LOCK:
+                        SCHEDULE_CONFIG["lastError"] = str(exc)[:200]
+                        _save_radar_store()
+                    raise
                 self.send_json({
                     "ok": True,
                     "sessionId": session_id,
@@ -2353,8 +2792,33 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = json.loads(body.decode("utf-8"))
                 source_url = str(payload.get("url", "")).strip()
                 platform_key, platform_label = validate_extension_source(str(payload.get("platform", "")), source_url)
-                jobs = normalize_extension_jobs(payload.get("jobs"), platform_key, platform_label, source_url)
                 radar_task_id = str(payload.get("radarTaskId", ""))[:80]
+                raw_detail = payload.get("detail")
+                if isinstance(raw_detail, dict) and radar_task_id:
+                    with EXTENSION_INBOX_LOCK:
+                        session_id = ACTIVE_EXTENSION_SESSION
+                        session = EXTENSION_SESSIONS.get(session_id or "")
+                        if not session_id or not isinstance(session, dict):
+                            raise ValueError("岗位详情没有对应的雷达会话，请重新开始采集。")
+                        sequence = int(session.get("sequence", 0))
+                    detail = {
+                        "description": str(raw_detail.get("description", ""))[:6000],
+                        "tags": [str(item)[:30] for item in raw_detail.get("tags", [])[:16]] if isinstance(raw_detail.get("tags"), list) else [],
+                        "education": str(raw_detail.get("education", ""))[:40],
+                        "experience": str(raw_detail.get("experience", ""))[:40],
+                    }
+                    radar = radar_record_batch(session_id, radar_task_id, {"detail": detail, "jobs": []})
+                    self.send_json({
+                        "ok": True,
+                        "sessionId": session_id,
+                        "sequence": sequence,
+                        "count": 0,
+                        "platform": platform_label,
+                        "radar": radar,
+                        "nextTask": radar.get("currentTask"),
+                    })
+                    return
+                jobs = normalize_extension_jobs(payload.get("jobs"), platform_key, platform_label, source_url)
                 batch = {
                     "platform": platform_key,
                     "platformLabel": platform_label,
@@ -2602,6 +3066,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/greetings":
                 payload = json.loads(body.decode("utf-8"))
+                requested_provider = payload.get("provider", requested_provider)
+                provider_id = resolve_provider(requested_provider)
                 profile = payload.get("profile")
                 if not isinstance(profile, dict):
                     raise ValueError("请先上传并分析简历。")
