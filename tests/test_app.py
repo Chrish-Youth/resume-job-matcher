@@ -2,8 +2,12 @@ import json
 import re
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -225,6 +229,48 @@ class ExtensionSessionTests(unittest.TestCase):
         self.assertEqual(second_batches[0]["jobs"][0]["title"], "岗位二")
         self.assertNotEqual(first_batches[0]["sessionId"], second_batches[0]["sessionId"])
 
+    def test_old_capture_cannot_send_jobs_to_new_session(self):
+        app.activate_extension_session("capture_oldsession", "zhaopin")
+        app.activate_extension_session("capture_newsession", "boss")
+        with self.assertRaisesRegex(ValueError, "替换"):
+            app.enqueue_extension_batch({"jobs": [make_job(1)]}, "capture_oldsession")
+        sequence, batches = app.extension_batches_after("capture_newsession", 0)
+        self.assertEqual(sequence, 0)
+        self.assertEqual(batches, [])
+
+    def test_search_collects_multiple_pages_before_advancing_task(self):
+        profile = {"city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"]}
+        session_id = "capture_multipage1"
+        plan = app.generate_search_plan(profile, None, ["zhaopin"])
+        radar = app.start_radar_session(session_id, plan)
+        task_id = radar["currentTask"]["id"]
+        page_one = {"jobs": [make_job(1)], "pageNumber": 1, "continueSearch": True}
+        first = app.radar_record_batch(session_id, task_id, page_one)
+        self.assertEqual(first["completed"], 0)
+        self.assertEqual(first["currentTask"]["pagesCollected"], 1)
+
+        repeated = app.radar_record_batch(session_id, task_id, page_one)
+        self.assertEqual(repeated["collected"], 1)
+        second = app.radar_record_batch(session_id, task_id, {
+            "jobs": [make_job(1), make_job(2)], "pageNumber": 2, "continueSearch": False,
+        })
+        self.assertEqual(second["completed"], 1)
+        self.assertEqual(second["collected"], 3)
+        self.assertEqual(second["unique"], 2)
+        self.assertEqual(second["duplicates"], 1)
+
+    def test_paging_stops_at_limit_even_if_extension_requests_more(self):
+        session_id = "capture_pagelimit1"
+        plan = app.generate_search_plan({"searchKeyword": "环境工程"}, None, ["zhaopin"])
+        radar = app.start_radar_session(session_id, plan)
+        task_id = radar["currentTask"]["id"]
+        for page_number in range(1, 4):
+            radar = app.radar_record_batch(session_id, task_id, {
+                "jobs": [make_job(page_number)], "pageNumber": page_number, "continueSearch": True,
+            })
+        self.assertEqual(radar["completed"], 1)
+        self.assertNotEqual(radar["currentTask"]["id"], task_id)
+
     def test_radar_advances_and_deduplicates_job_pool(self):
         session_id = "capture_radar123456"
         profile = {"city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"]}
@@ -318,6 +364,67 @@ class PersistenceTests(unittest.TestCase):
             self.assertTrue(app._save_radar_store())
         self.assertEqual(attempts["count"], 2)
         fake_sleep.assert_called_once()
+
+
+class RadarApiTests(unittest.TestCase):
+    def setUp(self):
+        app.EXTENSION_SESSIONS.clear()
+        app.ACTIVE_EXTENSION_SESSION = None
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        app.EXTENSION_SESSIONS.clear()
+        app.ACTIVE_EXTENSION_SESSION = None
+
+    def request(self, path, payload=None):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        headers = {"Host": "127.0.0.1:8765", "Content-Type": "application/json"}
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        connection.request("POST" if body is not None else "GET", path, body=body, headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        result = json.loads(response.read())
+        connection.close()
+        return status, result
+
+    def test_search_finishes_through_api_without_dashboard_finalize_request(self):
+        session_id = "capture_api_automatic"
+        profile = {"city": "上海", "searchKeyword": "环境工程", "skills": ["环境监测"]}
+        status, started = self.request("/api/radar/start", {
+            "sessionId": session_id, "profile": profile, "platforms": ["zhaopin"],
+        })
+        self.assertEqual(status, 200)
+        radar = started["radar"]
+        first_task = radar["currentTask"]
+        status, received = self.request("/api/extension/collect", {
+            "sessionId": session_id, "platform": "zhaopin", "radarTaskId": first_task["id"],
+            "url": first_task["url"], "pageNumber": 1, "continueSearch": False,
+            "jobs": [make_job(1)],
+        })
+        self.assertEqual(status, 200)
+        radar = received["radar"]
+        while radar.get("currentTask"):
+            status, received = self.request("/api/radar/skip", {
+                "sessionId": session_id, "taskId": radar["currentTask"]["id"],
+            })
+            self.assertEqual(status, 200)
+            radar = received["radar"]
+        result = None
+        for attempt in range(20):
+            status, result = self.request(f"/api/radar/results?session={session_id}")
+            self.assertEqual(status, 200)
+            if result["ready"]:
+                break
+            time.sleep(0.1)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["radar"]["status"], "finalized")
+        self.assertEqual(len(result["jobs"]), 1)
+        self.assertEqual(result["engine"]["mode"], "local")
 
 
 class HostValidationTests(unittest.TestCase):
@@ -522,6 +629,56 @@ class ScheduledRadarTests(unittest.TestCase):
             self.assertEqual(len(session["finalizedJobs"]), 1)
         self.assertEqual(app.LAST_SCHEDULED["summary"]["newCount"], 1)
         self.assertEqual(app.LAST_SCHEDULED["ids"], ["sched-job-1"])
+
+    def test_normal_radar_finishes_without_dashboard_and_preserves_schedule_results(self):
+        session_id = "capture_autofinish1"
+        profile = {"city": "上海", "skills": ["环境监测"]}
+        app.start_radar_session(session_id, {"tasks": [], "groups": []}, profile, auto_finalize=True)
+        app.EXTENSION_SESSIONS[session_id]["jobPool"] = [make_job(1)]
+        app.EXTENSION_SESSIONS[session_id]["radar"]["status"] = "ready"
+        old_summary = {"runId": "scheduled-previous"}
+        app.LAST_SCHEDULED["summary"] = old_summary
+        with patch.object(app.time, "sleep"):
+            app._auto_finalize_scheduled_worker(session_id)
+        result = app.radar_results_payload(session_id)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["radar"]["status"], "finalized")
+        self.assertEqual(len(result["jobs"]), 1)
+        self.assertEqual(result["engine"]["mode"], "local")
+        self.assertEqual(app.LAST_SCHEDULED["summary"], old_summary)
+
+    def test_duplicate_finalize_worker_does_not_repeat_model_matching(self):
+        session_id = "capture_oncefinish1"
+        app.start_radar_session(session_id, {"tasks": []}, {}, auto_finalize=True)
+        app.EXTENSION_SESSIONS[session_id]["jobPool"] = [make_job(1)]
+        app.EXTENSION_SESSIONS[session_id]["radar"]["status"] = "ready"
+
+        def fake_finalize(profile, jobs, provider):
+            app._auto_finalize_scheduled_worker(session_id)
+            return jobs, 0, None
+
+        with patch.object(app.time, "sleep"), patch.object(app, "finalize_radar_jobs", side_effect=fake_finalize) as mocked:
+            app._auto_finalize_scheduled_worker(session_id)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(app.radar_state(session_id)["status"], "finalized")
+
+    def test_restart_recovers_interrupted_finalization(self):
+        session_id = "capture_restartfinish1"
+        app.start_radar_session(session_id, {"tasks": []}, {}, auto_finalize=True)
+        app.EXTENSION_SESSIONS[session_id]["radar"]["status"] = "finalizing"
+        with patch.object(app, "maybe_auto_finalize_scheduled") as mocked:
+            app.recover_radar_finalizations()
+        mocked.assert_called_once_with(session_id)
+        self.assertEqual(app.radar_state(session_id)["status"], "ready")
+
+    def test_completed_results_survive_overnight_reopen(self):
+        session_id = "capture_retainedresult1"
+        app.start_radar_session(session_id, {"tasks": []}, {})
+        session = app.EXTENSION_SESSIONS[session_id]
+        session["finalizedJobs"] = [make_job(1)]
+        session["radar"]["status"] = "finalized"
+        app.cleanup_extension_sessions(now=session["updatedAt"] + 24 * 60 * 60)
+        self.assertTrue(app.radar_results_payload(session_id)["ready"])
 
     def test_store_roundtrip_preserves_schedule_and_session(self):
         self._enable_schedule()

@@ -32,6 +32,8 @@ ZHAOPIN_CACHE_TTL = 30 * 60
 ZHAOPIN_CACHE: dict[str, tuple[float, list[dict]]] = {}
 EXTENSION_INBOX_LOCK = threading.Lock()
 EXTENSION_SESSION_TTL = 4 * 60 * 60
+RADAR_ACTIVE_TTL = 24 * 60 * 60
+RADAR_RESULT_TTL = 7 * 24 * 60 * 60
 EXTENSION_SESSIONS: dict[str, dict[str, object]] = {}
 ACTIVE_EXTENSION_SESSION: str | None = None
 LLM_CACHE_TTL = 6 * 60 * 60
@@ -69,6 +71,8 @@ LAST_SCHEDULED: dict = {
 JOB_FEEDBACK: dict[str, dict] = {}
 STORE_STATUS: dict = {"ok": True, "error": None, "savedAt": 0}
 RADAR_DETAIL_LIMIT = 12
+RADAR_SEARCH_PAGE_LIMIT = 3
+RADAR_SEARCH_JOB_LIMIT = 120
 
 
 def _load_radar_store() -> None:
@@ -936,6 +940,7 @@ def build_search_plan(
                     "city": city,
                     "url": build_search_url(platform, city, query),
                     "status": "pending",
+                    "maxPages": RADAR_SEARCH_PAGE_LIMIT,
                 })
     return {
         "groups": groups,
@@ -1876,7 +1881,7 @@ def normalize_extension_jobs(raw_jobs: object, platform_key: str, platform_label
         raise ValueError("扩展没有返回有效职位列表。")
     output: list[dict] = []
     seen: set[str] = set()
-    for index, raw in enumerate(raw_jobs[:80]):
+    for index, raw in enumerate(raw_jobs[:RADAR_SEARCH_JOB_LIMIT]):
         if not isinstance(raw, dict):
             continue
         title = str(raw.get("title", "")).strip()
@@ -1924,9 +1929,15 @@ def normalize_session_id(value: object) -> str:
 
 def cleanup_extension_sessions(now: float | None = None) -> None:
     current = now or time.time()
+    def lifetime(session: dict) -> int:
+        if isinstance(session.get("finalizedJobs"), list):
+            return RADAR_RESULT_TTL
+        if (session.get("radar") or {}).get("status") in {"running", "paused_blocked", "ready", "finalizing"}:
+            return RADAR_ACTIVE_TTL
+        return EXTENSION_SESSION_TTL
     expired = [
         session_id for session_id, session in EXTENSION_SESSIONS.items()
-        if current - float(session.get("updatedAt", 0)) > EXTENSION_SESSION_TTL
+        if current - float(session.get("updatedAt", 0)) > lifetime(session)
     ]
     for session_id in expired:
         EXTENSION_SESSIONS.pop(session_id, None)
@@ -1950,14 +1961,16 @@ def activate_extension_session(session_id: str, platform: str = "") -> dict:
         return {"sessionId": session_id, "sequence": int(session["sequence"])}
 
 
-def enqueue_extension_batch(batch: dict) -> tuple[str, int]:
+def enqueue_extension_batch(batch: dict, requested_session: str | None = None) -> tuple[str, int]:
     global ACTIVE_EXTENSION_SESSION
     now = time.time()
     with EXTENSION_INBOX_LOCK:
         cleanup_extension_sessions(now)
-        session_id = ACTIVE_EXTENSION_SESSION
+        session_id = requested_session or ACTIVE_EXTENSION_SESSION
         if not session_id or session_id not in EXTENSION_SESSIONS:
             raise ValueError("没有等待采集的简历会话，请先从助手页面点击“开始采集”。")
+        if requested_session and requested_session != ACTIVE_EXTENSION_SESSION:
+            raise ValueError("该采集会话已被新一轮搜索替换。")
         session = EXTENSION_SESSIONS[session_id]
         sequence = int(session["sequence"]) + 1
         batch["sequence"] = sequence
@@ -2009,6 +2022,7 @@ def radar_public_state(radar: dict | None) -> dict:
         "startedAt": radar.get("startedAt"),
         "detailTotal": int(radar.get("detailTotal", 0)),
         "detailCompleted": int(radar.get("detailCompleted", 0)),
+        "error": radar.get("error"),
     }
     if radar.get("blockedReason"):
         public["blockedReason"] = radar["blockedReason"]
@@ -2131,6 +2145,17 @@ def radar_record_batch(session_id: str, task_id: str, batch: dict) -> dict:
         current = tasks[cursor]
         if task_id != current.get("id"):
             return radar_public_state(radar)
+        page_number = batch.get("pageNumber")
+        if current.get("type") != "detail" and page_number is not None:
+            try:
+                page_number = int(page_number)
+            except (TypeError, ValueError):
+                raise ValueError("采集页码无效。")
+            expected_page = int(current.get("pagesCollected", 0)) + 1
+            if page_number < expected_page:
+                return radar_public_state(radar)
+            if page_number != expected_page or page_number > RADAR_SEARCH_PAGE_LIMIT:
+                raise ValueError("采集页码与当前搜索任务不一致。")
         jobs = batch.get("jobs", [])
         pool = session.get("jobPool")
         if not isinstance(pool, list):
@@ -2192,12 +2217,23 @@ def radar_record_batch(session_id: str, task_id: str, batch: dict) -> dict:
             existing[key] = len(pool)
             pool.append(job)
             added += 1
-        current["status"] = "completed"
-        current["collected"] = len(jobs) if isinstance(jobs, list) else 0
-        current["unique"] = added
-        radar["collected"] = int(radar.get("collected", 0)) + current["collected"]
+        page_count = len(jobs) if isinstance(jobs, list) else 0
+        current["collected"] = int(current.get("collected", 0)) + page_count
+        current["unique"] = int(current.get("unique", 0)) + added
+        radar["collected"] = int(radar.get("collected", 0)) + page_count
         radar["unique"] = len(pool)
         radar["duplicates"] = int(radar.get("collected", 0)) - len(pool)
+        if page_number is not None:
+            current["pagesCollected"] = page_number
+        if batch.get("continueSearch") is True and (
+            int(current.get("pagesCollected", 0)) < RADAR_SEARCH_PAGE_LIMIT
+            and int(current.get("collected", 0)) < RADAR_SEARCH_JOB_LIMIT
+        ):
+            current["status"] = "running"
+            session["updatedAt"] = now
+            _save_radar_store()
+            return radar_public_state(radar)
+        current["status"] = "completed"
         radar["cursor"] = cursor + 1
         if radar["cursor"] >= len(tasks):
             added_details = prepare_radar_detail_tasks(session, radar)
@@ -2336,7 +2372,7 @@ def start_scheduled_radar() -> tuple[str, dict]:
             raise ValueError("尚未设置定时雷达或缺少简历画像。")
         if ACTIVE_EXTENSION_SESSION:
             active = EXTENSION_SESSIONS.get(ACTIVE_EXTENSION_SESSION)
-            if isinstance(active, dict) and isinstance(active.get("radar"), dict) and active["radar"].get("status") == "running":
+            if isinstance(active, dict) and isinstance(active.get("radar"), dict) and active["radar"].get("status") in {"running", "paused_blocked", "ready", "finalizing"}:
                 raise ValueError("已有正在运行的岗位雷达，稍后再试。")
         platforms = [
             str(item) for item in schedule.get("platforms", ["zhaopin", "boss"])
@@ -2384,10 +2420,15 @@ def _auto_finalize_scheduled_worker(session_id: str) -> None:
             provider_id = session.get("provider")
             if not isinstance(profile, dict):
                 return
+            radar["status"] = "finalizing"
+            radar["finalizingAt"] = int(time.time())
+            _save_radar_store()
         jobs, radar_state = radar_job_pool(session_id)
         if not jobs:
             raise ValueError("本轮没有采集到可用岗位，请检查招聘页面、登录状态或筛选条件。")
         ranked, excluded_count, warning = finalize_radar_jobs(profile, jobs, provider_id)
+        matched_provider = provider_id if any(job.get("matchEngine") == "ai" for job in ranked) else None
+        result_engine = engine_info(matched_provider, warning)
         previous_ids = set(LAST_SCHEDULED.get("ids", []))
         current_ids = [str(job["id"]) for job in ranked if job.get("id")]
         new_ids = [job_id for job_id in current_ids if job_id not in previous_ids]
@@ -2400,31 +2441,78 @@ def _auto_finalize_scheduled_worker(session_id: str) -> None:
         }
         with EXTENSION_INBOX_LOCK:
             session = EXTENSION_SESSIONS.get(session_id)
+            if not isinstance(session, dict) or (session.get("radar") or {}).get("status") != "finalizing":
+                return
             if session:
                 session["finalizedJobs"] = ranked
                 session["excludedCount"] = excluded_count
+                session["finalizedEngine"] = result_engine
                 radar = session.get("radar")
                 if isinstance(radar, dict):
                     radar["status"] = "finalized"
                     radar["finalizedAt"] = int(time.time())
                     radar["warning"] = warning
-            LAST_SCHEDULED["profile"] = profile
-            LAST_SCHEDULED["jobs"] = ranked
-            LAST_SCHEDULED["ids"] = current_ids
-            LAST_SCHEDULED["engine"] = engine_info(provider_id, warning)
-            LAST_SCHEDULED["summary"] = summary
-            SCHEDULE_CONFIG["lastError"] = None
+            if session_id.startswith("sched_"):
+                LAST_SCHEDULED["profile"] = profile
+                LAST_SCHEDULED["jobs"] = ranked
+                LAST_SCHEDULED["ids"] = current_ids
+                LAST_SCHEDULED["engine"] = result_engine
+                LAST_SCHEDULED["summary"] = summary
+                SCHEDULE_CONFIG["lastError"] = None
             _save_radar_store()
     except Exception as exc:
         with EXTENSION_INBOX_LOCK:
-            SCHEDULE_CONFIG["lastError"] = str(exc)[:200]
+            if session_id.startswith("sched_"):
+                SCHEDULE_CONFIG["lastError"] = str(exc)[:200]
             session = EXTENSION_SESSIONS.get(session_id)
             radar = session.get("radar") if isinstance(session, dict) else None
             if isinstance(radar, dict):
                 radar["status"] = "error"
                 radar["error"] = str(exc)[:200]
             _save_radar_store()
-        print(f"定时雷达自动整理失败：{exc}", file=sys.stderr)
+        print(f"岗位雷达自动整理失败：{exc}", file=sys.stderr)
+
+
+def recover_radar_finalizations() -> None:
+    """服务恢复后继续整理已采集的岗位，不依赖助手网页。"""
+    pending = []
+    with EXTENSION_INBOX_LOCK:
+        cleanup_extension_sessions()
+        for session_id, session in EXTENSION_SESSIONS.items():
+            radar = session.get("radar")
+            if session.get("autoFinalize") is not True or not isinstance(radar, dict):
+                continue
+            if radar.get("status") == "finalizing":
+                radar["status"] = "ready"
+            if radar.get("status") == "ready":
+                pending.append(session_id)
+        if pending:
+            _save_radar_store()
+    for session_id in pending:
+        maybe_auto_finalize_scheduled(session_id)
+
+
+def radar_results_payload(session_id: str) -> dict:
+    with EXTENSION_INBOX_LOCK:
+        session = EXTENSION_SESSIONS.get(session_id)
+        if not isinstance(session, dict):
+            raise ValueError("该雷达会话已过期，请重新开始搜索。")
+        radar = radar_public_state(session.get("radar"))
+        jobs = session.get("finalizedJobs")
+        if not isinstance(jobs, list):
+            return {"ready": False, "radar": radar}
+        return {
+            "ready": True,
+            "jobs": jobs,
+            "radar": radar,
+            "engine": session.get("finalizedEngine") or engine_info(None, radar.get("warning")),
+            "source": {
+                "name": "岗位雷达", "count": len(jobs),
+                "collectedCount": radar["collected"], "uniqueCount": radar["unique"],
+                "duplicateCount": radar["duplicates"],
+                "excludedCount": int(session.get("excludedCount", 0)),
+            },
+        }
 
 
 def parse_multipart(content_type: str, body: bytes) -> tuple[str, bytes]:
@@ -2523,6 +2611,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"radar": {"status": "idle", "active": False}})
                 return
             self.send_json({"sessionId": session_id, "radar": radar_state(session_id)})
+            return
+        if path == "/api/radar/results":
+            if not self.extension_origin_allowed():
+                self.send_json({"error": "只接受本机助手读取雷达结果。"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                session_id = normalize_session_id(query.get("session", [""])[0])
+                self.send_json(radar_results_payload(session_id))
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if path == "/api/radar/schedule":
             if not self.extension_origin_allowed():
@@ -2635,7 +2734,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 plan = generate_search_plan(profile, provider_id, [str(item) for item in platforms])
                 if not plan.get("tasks"):
                     raise ValueError("没有生成有效的搜索计划，请补充求职方向后重试。")
-                radar = start_radar_session(session_id, plan, profile, provider_id)
+                radar = start_radar_session(session_id, plan, profile, provider_id, auto_finalize=True)
                 self.send_json({
                     "ok": True,
                     "sessionId": session_id,
@@ -2743,6 +2842,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("请先上传并分析简历。")
                 session_id = normalize_session_id(payload.get("sessionId"))
                 jobs, radar = radar_job_pool(session_id)
+                with EXTENSION_INBOX_LOCK:
+                    session = EXTENSION_SESSIONS.get(session_id)
+                    auto_pending = isinstance(session, dict) and session.get("autoFinalize") is True and radar.get("status") == "ready"
+                if auto_pending:
+                    maybe_auto_finalize_scheduled(session_id)
+                    self.send_json({"pending": True, "radar": radar}, HTTPStatus.ACCEPTED)
+                    return
+                if radar.get("status") == "finalizing":
+                    self.send_json({"pending": True, "radar": radar}, HTTPStatus.ACCEPTED)
+                    return
                 stored_jobs = None
                 stored_excluded = 0
                 stored_warning = None
@@ -2760,8 +2869,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     ranked, excluded_count, warning = finalize_radar_jobs(profile, jobs, provider_id)
                 if not ranked:
                     raise ValueError("采集到的岗位都被当前硬性条件排除了，请放宽城市、薪资或应届条件。")
-                radar = mark_radar_finalized(session_id)
                 matched_by_ai = provider_id if any(job.get("matchEngine") == "ai" for job in ranked) else None
+                with EXTENSION_INBOX_LOCK:
+                    session = EXTENSION_SESSIONS.get(session_id)
+                    if isinstance(session, dict):
+                        session["finalizedJobs"] = ranked
+                        session["excludedCount"] = excluded_count
+                        session["finalizedEngine"] = engine_info(matched_by_ai, warning)
+                radar = mark_radar_finalized(session_id)
                 self.send_json({
                     "jobs": ranked,
                     "radar": radar,
@@ -2794,6 +2909,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 platform_key, platform_label = validate_extension_source(str(payload.get("platform", "")), source_url)
                 radar_task_id = str(payload.get("radarTaskId", ""))[:80]
                 raw_detail = payload.get("detail")
+                requested_session = payload.get("sessionId")
+                if requested_session is not None:
+                    requested_session = normalize_session_id(requested_session)
+                    if requested_session != ACTIVE_EXTENSION_SESSION:
+                        raise ValueError("该采集会话已被新一轮搜索替换。")
                 if isinstance(raw_detail, dict) and radar_task_id:
                     with EXTENSION_INBOX_LOCK:
                         session_id = ACTIVE_EXTENSION_SESSION
@@ -2826,9 +2946,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     "pageTitle": str(payload.get("pageTitle", ""))[:160],
                     "capturedAt": int(time.time()),
                     "radarTaskId": radar_task_id,
+                    "pageNumber": payload.get("pageNumber"),
+                    "continueSearch": payload.get("continueSearch") is True,
                     "jobs": jobs,
                 }
-                session_id, sequence = enqueue_extension_batch(batch)
+                session_id, sequence = enqueue_extension_batch(batch, requested_session)
                 radar = radar_record_batch(session_id, radar_task_id, batch) if radar_task_id else radar_state(session_id)
                 self.send_json({
                     "ok": True,
@@ -3115,6 +3237,7 @@ def main() -> None:
     host = "127.0.0.1"
     port = 8765
     server = ThreadingHTTPServer((host, port), AppHandler)
+    recover_radar_finalizations()
     print(f"\n  职得 · 简历岗位匹配助手")
     print(f"  http://{host}:{port}\n")
     try:

@@ -2,6 +2,52 @@
   const clean = value => String(value || "").replace(/\s+/g, " ").trim();
   const uniq = values => [...new Set(values.map(clean).filter(Boolean))];
   const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  const API = "http://127.0.0.1:8765";
+  let radarRunning = false;
+  let nextRadarCheckAt = 0;
+  let radarFailures = 0;
+  let pendingCapture = null;
+
+  async function radarRequest(path, payload) {
+    if (payload?.sessionId && ["/api/extension/collect", "/api/radar/skip"].includes(path)) {
+      sessionStorage.setItem(`zhideRadarLastSubmitted:${payload.sessionId}`, payload.radarTaskId || payload.taskId);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(API + path, {
+        method: payload ? "POST" : "GET",
+        headers: payload ? { "Content-Type": "application/json" } : undefined,
+        body: payload ? JSON.stringify(payload) : undefined,
+        cache: "no-store", signal: controller.signal
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `本地助手返回 ${response.status}`);
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+
+  function taskMatchesPage(task) {
+    if (!task || task.platform !== currentPlatform()) return false;
+    try {
+      const expected = new URL(task.url);
+      const current = new URL(location.href);
+      if (task.type === "detail") {
+        return expected.hostname === current.hostname &&
+          expected.pathname.replace(/\/$/, "") === current.pathname.replace(/\/$/, "");
+      }
+      const queryName = task.platform === "boss" ? "query" : "kw";
+      const expectedQuery = expected.searchParams.get(queryName);
+      const currentQuery = current.searchParams.get(queryName);
+      if (expectedQuery && currentQuery) {
+        if (clean(expectedQuery) !== clean(currentQuery)) return false;
+      } else if (!decodeURIComponent(current.href).toLowerCase().includes(String(task.query || "").toLowerCase())) {
+        return false;
+      }
+      const city = expected.searchParams.get("city");
+      return !city || current.searchParams.get("city") === city;
+    } catch { return false; }
+  }
 
   function currentPlatform() {
     const host = location.hostname.toLowerCase();
@@ -123,15 +169,67 @@
   }
 
   async function scrollAndCollect(platform, autoScroll) {
-    if (autoScroll) {
-      const originalY = window.scrollY;
-      for (let index = 0; index < 4; index += 1) {
-        window.scrollBy({ top: Math.max(window.innerHeight * 0.85, 650), behavior: "smooth" });
-        await new Promise(resolve => setTimeout(resolve, 700));
+    if (!autoScroll) return collect(platform);
+    const originalY = window.scrollY;
+    const jobs = new Map();
+    const merge = () => {
+      for (const job of collect(platform)) {
+        const key = `${job.title}|${job.company}|${job.location}`.toLowerCase();
+        if (!jobs.has(key)) jobs.set(key, job);
       }
-      window.scrollTo({ top: originalY, behavior: "smooth" });
+    };
+    merge();
+    let unchanged = 0;
+    for (let index = 0; index < 8 && jobs.size < 60; index += 1) {
+      const before = jobs.size;
+      window.scrollBy({ top: Math.max(window.innerHeight * 0.85, 650), behavior: "smooth" });
+      await wait(700);
+      merge();
+      unchanged = jobs.size === before ? unchanged + 1 : 0;
+      const atBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80;
+      if (atBottom && unchanged >= 2) break;
     }
-    return collect(platform);
+    window.scrollTo({ top: originalY, behavior: "smooth" });
+    await wait(400);
+    merge();
+    return [...jobs.values()].slice(0, 60);
+  }
+
+  function nextPageButton() {
+    const selectors = [
+      "a[rel='next']", "button[aria-label='下一页']", "a[aria-label='下一页']",
+      "button[aria-label='Next page']", ".btn-next", ".ant-pagination-next",
+      ".pagination-next", "[class*='pagination'] a", "[class*='pagination'] button",
+      "[class*='pagination'] li", "[class*='page-box'] a"
+    ];
+    for (const selector of selectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        if (!node.getClientRects().length || node.disabled || node.getAttribute("aria-disabled") === "true" ||
+            node.closest(".disabled, .is-disabled, [aria-disabled='true']") || /disabled/.test(node.className || "")) continue;
+        const label = clean(node.getAttribute("aria-label") || node.getAttribute("title") || node.textContent);
+        if (/^(下一页|下页|next(?: page)?|[>›»])$/i.test(label) ||
+            node.matches("a[rel='next'], .btn-next, .ant-pagination-next, .pagination-next")) return node;
+      }
+    }
+    return null;
+  }
+
+  function pageSignature(platform) {
+    return collect(platform).map(job => `${job.title}|${job.company}|${job.location}`).sort().join("\n");
+  }
+
+  async function advanceSearchPage(platform) {
+    const button = nextPageButton();
+    if (!button) return false;
+    const signature = pageSignature(platform);
+    button.click();
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await wait(700);
+      if (blockedPageReason()) return false;
+      const changed = pageSignature(platform);
+      if (changed && changed !== signature) return true;
+    }
+    return false;
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -148,14 +246,7 @@
   });
 
   async function sendRadarSkip(sessionId, taskId) {
-    const response = await fetch("http://127.0.0.1:8765/api/radar/skip", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, taskId })
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "无法跳过当前搜索任务。");
-    return data;
+    return radarRequest("/api/radar/skip", { sessionId, taskId });
   }
 
   function blockedPageReason() {
@@ -175,7 +266,7 @@
     let jobs = [];
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       jobs = await scrollAndCollect(platform, true);
-      if (jobs.length) return jobs;
+      if (jobs.length || blockedPageReason()) return jobs;
       if (attempt < attempts) {
         showRadarStatus(`第 ${attempt} 次未识别到岗位，稍后自动重试…`);
         await wait(4000 * attempt);
@@ -215,41 +306,7 @@
   }
 
   async function reportRadarBlocked(sessionId, taskId, reason) {
-    try {
-      const response = await fetch("http://127.0.0.1:8765/api/radar/blocked", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId, taskId, reason })
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "阻塞上报失败。");
-      return data;
-    } catch (error) {
-      showRadarStatus(`无法连接本地助手：${error.message || "请检查应用是否在运行"}`, "error");
-      return null;
-    }
-  }
-
-  async function watchRadarResume() {
-    const platform = currentPlatform();
-    if (!platform) return;
-    let active;
-    try {
-      const response = await fetch("http://127.0.0.1:8765/api/radar/active", { cache: "no-store" });
-      if (!response.ok) return;
-      active = await response.json();
-    } catch {
-      return;
-    }
-    const radar = active.radar;
-    const task = radar?.currentTask;
-    if (!active.sessionId || !radar?.active || !task) return;
-    const blockedKey = `zhideRadarBlocked:${active.sessionId}:${task.id}`;
-    if (!sessionStorage.getItem(blockedKey)) return;
-    sessionStorage.removeItem(blockedKey);
-    showRadarStatus(`雷达已恢复，正在重新进入「${task.query}」…`);
-    await wait(800);
-    location.assign(task.url);
+    return radarRequest("/api/radar/blocked", { sessionId, taskId, reason });
   }
 
   async function continueRadar(nextTask, completed, total) {
@@ -263,34 +320,55 @@
   }
 
   async function runRadar() {
+    if (radarRunning || Date.now() < nextRadarCheckAt) return;
     const platform = currentPlatform();
     if (!platform) return;
-    await wait(1800);
-    let activeResponse;
+    radarRunning = true;
     try {
-      activeResponse = await fetch("http://127.0.0.1:8765/api/radar/active", { cache: "no-store" });
-    } catch {
-      return;
-    }
-    if (!activeResponse.ok) return;
-    const active = await activeResponse.json();
-    const radar = active.radar;
-    const task = radar?.currentTask;
-    if (!active.sessionId || !radar?.active || !task || task.platform !== platform) return;
-    let readableUrl = location.href.toLowerCase();
-    try { readableUrl = decodeURIComponent(location.href).toLowerCase(); } catch { /* 保留编码后的地址 */ }
-    if (task.type === "detail") {
-      try {
-        const currentPath = new URL(location.href).pathname.replace(/\/$/, "");
-        const taskPath = new URL(task.url).pathname.replace(/\/$/, "");
-        if (!currentPath || currentPath !== taskPath) return;
-      } catch { return; }
-    } else if (!readableUrl.includes(String(task.query || "").toLowerCase())) return;
-    const runKey = `zhideRadar:${active.sessionId}:${task.id}`;
-    if (sessionStorage.getItem(runKey)) return;
-    sessionStorage.setItem(runKey, "1");
-    showRadarStatus(`岗位雷达 ${radar.completed + 1}/${radar.total}：正在采集「${task.query}」`);
-    try {
+      const active = await radarRequest("/api/radar/active");
+      let radar = active.radar;
+      const task = radar?.currentTask;
+      if (!active.sessionId || !task) return;
+      const submittedKey = `zhideRadarLastSubmitted:${active.sessionId}`;
+      const submittedTask = sessionStorage.getItem(submittedKey);
+      if (radar.active && submittedTask && submittedTask !== task.id && !taskMatchesPage(task)) {
+        pendingCapture = null;
+        sessionStorage.setItem(submittedKey, "");
+        await continueRadar(task, radar.completed, radar.total);
+        return;
+      }
+      if (pendingCapture && pendingCapture.sessionId !== active.sessionId) pendingCapture = null;
+      if (pendingCapture && pendingCapture.radarTaskId !== task.id) {
+        pendingCapture = null;
+        if (radar.active) await continueRadar(task, radar.completed, radar.total);
+        return;
+      }
+      const ownedKey = `zhideRadarOwnedTask:${active.sessionId}`;
+      const ownsTask = sessionStorage.getItem(ownedKey) === task.id;
+      const matches = taskMatchesPage(task);
+      if (!matches && !ownsTask) return;
+      const pageReady = task.type === "detail"
+        ? collectCurrentJobDetail(platform).description.length >= 120
+        : collect(platform).length > 0;
+      const blockReason = blockedPageReason();
+      if (radar.active && blockReason && !pageReady) {
+        await reportRadarBlocked(active.sessionId, task.id, blockReason);
+        showRadarStatus(blockReason, "error");
+        return;
+      }
+      if (radar.status === "paused_blocked") {
+        if (!pageReady || blockReason) return;
+        const resumed = await radarRequest("/api/radar/resume", { sessionId: active.sessionId });
+        radar = resumed.radar;
+        showRadarStatus("页面已恢复，正在自动继续采集…");
+      }
+      if (!radar?.active) return;
+      if (!matches) {
+        await continueRadar(task, radar.completed, radar.total);
+        return;
+      }
+      sessionStorage.setItem(ownedKey, task.id);
+      showRadarStatus(`岗位雷达 ${radar.completed + 1}/${radar.total}：正在采集「${task.query}」`);
       let result;
       if (task.type === "detail") {
         const detail = collectCurrentJobDetail(platform);
@@ -299,63 +377,66 @@
           if (reason) {
             const blocked = await reportRadarBlocked(active.sessionId, task.id, reason);
             if (blocked?.ok) {
-              sessionStorage.removeItem(runKey);
-              sessionStorage.setItem(`zhideRadarBlocked:${active.sessionId}:${task.id}`, "1");
               showRadarStatus(reason, "error");
               return;
             }
           }
         }
-        const response = await fetch("http://127.0.0.1:8765/api/extension/collect", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            platform,
-            detail,
-            url: location.href,
-            pageTitle: document.title,
-            radarTaskId: task.id
-          })
+        result = await radarRequest("/api/extension/collect", {
+          platform, detail, sessionId: active.sessionId,
+          url: location.href, pageTitle: document.title, radarTaskId: task.id
         });
-        result = await response.json();
-        if (!response.ok) throw new Error(result.error || "岗位详情回传失败。");
       } else {
-        const jobs = await collectWithRetry(platform, 3);
+        const jobs = pendingCapture?.jobs || await collectWithRetry(platform, 3);
         if (!jobs.length) {
           const reason = blockedPageReason();
           if (reason) {
             const blocked = await reportRadarBlocked(active.sessionId, task.id, reason);
             if (blocked?.ok) {
-              sessionStorage.removeItem(runKey);
-              sessionStorage.setItem(`zhideRadarBlocked:${active.sessionId}:${task.id}`, "1");
               showRadarStatus(reason, "error");
               return;
             }
           }
           result = await sendRadarSkip(active.sessionId, task.id);
         } else {
-          const response = await fetch("http://127.0.0.1:8765/api/extension/collect", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              platform,
-              jobs,
-              url: location.href,
-              pageTitle: document.title,
-              radarTaskId: task.id
-            })
-          });
-          result = await response.json();
-          if (!response.ok) throw new Error(result.error || "岗位回传失败。");
+          const pageNumber = Number(task.pagesCollected || 0) + 1;
+          const maxPages = Math.min(3, Number(task.maxPages || 3));
+          pendingCapture ||= {
+            platform, jobs, sessionId: active.sessionId,
+            url: location.href, pageTitle: document.title, radarTaskId: task.id,
+            pageNumber, continueSearch: pageNumber < maxPages &&
+              Number(task.collected || 0) + jobs.length < 120 && Boolean(nextPageButton())
+          };
+          result = await radarRequest("/api/extension/collect", pendingCapture);
+          const continuing = pendingCapture.continueSearch && result.nextTask?.id === task.id;
+          pendingCapture = null;
+          if (continuing) {
+            showRadarStatus(`「${task.query}」已采集 ${result.radar.currentTask.pagesCollected} 页，正在打开下一页…`);
+            if (await advanceSearchPage(platform)) {
+              radarFailures = 0;
+              nextRadarCheckAt = Date.now() + 1000;
+              return;
+            }
+            const reason = blockedPageReason();
+            if (reason) {
+              await reportRadarBlocked(active.sessionId, task.id, reason);
+              showRadarStatus(reason, "error");
+              return;
+            }
+            result = await sendRadarSkip(active.sessionId, task.id);
+          }
         }
       }
+      radarFailures = 0;
       await continueRadar(result.nextTask, result.radar?.completed || radar.completed + 1, result.radar?.total || radar.total);
     } catch (error) {
-      sessionStorage.removeItem(runKey);
-      showRadarStatus(`岗位雷达暂停：${error.message || "采集失败"}`, "error");
-    }
+      radarFailures += 1;
+      const delay = Math.min(60000, 6000 * 2 ** Math.min(radarFailures - 1, 4));
+      nextRadarCheckAt = Date.now() + delay;
+      showRadarStatus(`连接暂时中断，${Math.round(delay / 1000)} 秒后自动重试：${error.message || "采集失败"}`, "error");
+    } finally { radarRunning = false; }
   }
 
-  runRadar();
-  setInterval(watchRadarResume, 6000);
+  wait(1800).then(runRadar);
+  setInterval(runRadar, 6000);
 })();

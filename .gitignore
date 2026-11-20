@@ -5,3 +5,9 @@ __pycache__/
 .impeccable/
 tmp/
 data/
+
+# Personal resumes and interview preparation materials are not project assets.
+/output/
+/MiniMax诊断素材/
+/MiniMax试岗_手机理论卡片.md
+/MiniMax试岗备考要点与练习提示词.md

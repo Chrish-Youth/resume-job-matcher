@@ -4,7 +4,8 @@ const state = {
   extensionSequence: 0, extensionImporting: false, extensionPlatforms: [], pendingCapturePlatform: null,
   captureSessionId: createSessionId(), modalReturnFocus: null, sourceMeta: null,
   radar: null, radarFinalizing: false, resultView: "all", batchGreetings: [], blockedNotified: false,
-  lastScheduledSeen: null, feedback: {}, pendingFeedbackJob: null
+  lastScheduledSeen: null, feedback: {}, pendingFeedbackJob: null,
+  radarChecking: false, radarResultsLoaded: ""
 };
 const WORKSPACE_STORAGE_KEY = "zhideWorkspaceV2";
 const PROVIDER_STORAGE_KEY = "zhideProviderV1";
@@ -73,7 +74,7 @@ async function loadFeedback() {
 }
 
 function saveWorkspace() {
-  if (!state.profile || !state.jobs.length) return;
+  if (!state.profile) return;
   try {
     const profile = { ...state.profile };
     delete profile.preview;
@@ -88,6 +89,7 @@ function saveWorkspace() {
       extensionPlatforms: state.extensionPlatforms,
       captureSessionId: state.captureSessionId,
       radar: state.radar,
+      radarResultsLoaded: state.radarResultsLoaded,
       resultView: state.resultView,
       preferences: currentPreferences(),
       filters: {
@@ -106,7 +108,7 @@ function restoreWorkspace() {
   let saved;
   try { saved = JSON.parse(localStorage.getItem(WORKSPACE_STORAGE_KEY) || "null"); }
   catch { saved = null; }
-  if (!saved || ![2, 3].includes(saved.version) || !saved.profile || !Array.isArray(saved.jobs) || !saved.jobs.length) return;
+  if (!saved || ![2, 3].includes(saved.version) || !saved.profile || !Array.isArray(saved.jobs)) return;
   state.profile = saved.profile;
   state.jobs = saved.jobs;
   state.visibleJobs = saved.jobs;
@@ -116,6 +118,7 @@ function restoreWorkspace() {
   state.extensionPlatforms = Array.isArray(saved.extensionPlatforms) ? saved.extensionPlatforms : [];
   if (saved.captureSessionId) state.captureSessionId = saved.captureSessionId;
   state.radar = saved.radar || null;
+  state.radarResultsLoaded = saved.radarResultsLoaded || "";
   state.resultView = ["all", "strong", "transferable", "saved", "new"].includes(saved.resultView) ? saved.resultView : "all";
   renderProfile();
   setSearchPreferences(saved.preferences);
@@ -877,6 +880,7 @@ function renderRadar() {
   const statusText = {
     running: current?.type === "detail" ? `正在复核「${current.query}」岗位详情` : current ? `正在搜索「${current.query}」` : "正在连续采集岗位",
     ready: "采集完成，准备统一匹配",
+    finalizing: "采集完成，正在自动匹配岗位",
     paused: "已停止采集，正在整理现有岗位",
     paused_blocked: "等待处理验证码 / 登录",
     finalized: "本轮岗位雷达已完成",
@@ -886,11 +890,13 @@ function renderRadar() {
   $("#radarDetail").textContent = radar.status === "error"
     ? (radar.error || "请检查招聘页面或放宽条件后重新开始。")
     : radar.status === "paused_blocked"
-    ? (radar.blockedReason || "招聘页面需要人工处理，完成后点击“继续雷达”。")
+    ? (radar.blockedReason || "请在招聘页面完成验证或登录，页面恢复后会自动继续。")
     : radar.status === "running"
     ? current?.type === "detail"
       ? `${current?.platformLabel || "招聘平台"} · 已复核 ${Number(radar.detailCompleted || 0)} / ${Number(radar.detailTotal || 0)} 个高潜岗位`
-      : `${current?.platformLabel || "招聘平台"} · ${current?.tierLabel || "扩展搜索范围"}`
+      : `${current?.platformLabel || "招聘平台"} · ${current?.tierLabel || "扩展搜索范围"} · 已采集 ${Number(current?.pagesCollected || 0)} 页`
+    : radar.status === "finalizing"
+      ? "后台正在去重与匹配；重新打开助手后会自动载入结果。"
     : radar.status === "finalized"
       ? "岗位已去重并完成统一评分，可按下方分组查看。"
       : "已采集的岗位会保留，不会因为停止而丢失。";
@@ -904,8 +910,9 @@ function renderRadar() {
   `).join("");
   const running = radar.status === "running";
   const blocked = radar.status === "paused_blocked";
-  els.startRadar.disabled = running || state.radarFinalizing;
-  els.startRadar.textContent = radar.status === "finalized" ? "开始新一轮搜索" : running ? "岗位雷达运行中" : blocked ? "等待恢复" : "重新开始岗位雷达";
+  const matching = ["ready", "finalizing"].includes(radar.status) || state.radarFinalizing;
+  els.startRadar.disabled = running || matching;
+  els.startRadar.textContent = matching ? "正在自动匹配岗位" : radar.status === "finalized" ? "开始新一轮搜索" : running ? "岗位雷达运行中" : blocked ? "等待恢复" : "重新开始岗位雷达";
   els.stopRadar.classList.toggle("hidden", !running);
   els.resumeRadar.classList.toggle("hidden", !blocked);
 }
@@ -945,6 +952,7 @@ async function startRadar(options = {}) {
   state.radarFinalizing = false;
   state.resultView = "all";
   state.blockedNotified = false;
+  state.radarResultsLoaded = "";
   updateResultTabs();
   els.startRadar.disabled = true;
   els.startRadar.textContent = "正在生成搜索计划…";
@@ -997,48 +1005,65 @@ async function stopRadar() {
 
 async function finalizeRadar() {
   if (state.radarFinalizing) return;
+  const sessionId = state.captureSessionId;
   state.radarFinalizing = true;
   renderRadar();
   setCaptureStatus("正在统一匹配岗位", "先用本地规则初筛全部岗位，再由大模型精排更值得看的候选。", "working");
   try {
     const response = await fetchWithTimeout(`/api/radar/finalize?provider=${encodeURIComponent(currentProvider())}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: state.captureSessionId, profile: profileForRequest() })
+      body: JSON.stringify({ sessionId, profile: profileForRequest() })
     }, 180000);
     const data = await response.json();
+    if (sessionId !== state.captureSessionId) return;
     if (!response.ok) throw new Error(data.error || "岗位池整理失败");
-    state.jobs = mergeRadarJobs(data.jobs);
-    state.visibleJobs = state.jobs;
-    state.radar = data.radar;
-    state.jobSource = "岗位雷达真实岗位";
-    state.extensionPlatforms = ["智联招聘", "BOSS直聘"];
-    refreshFilterOptions(true);
-    applyEngine(data.engine);
-    updateResultTabs();
-    filterAndRender();
-    renderRadar();
-    updateSourceNotice(data.source);
-    saveWorkspace();
-    els.captureStatus.classList.add("hidden");
-    showToast("岗位雷达已完成，可以先看“重点推荐”");
+    if (data.pending) {
+      state.radar = data.radar;
+      saveWorkspace();
+      return;
+    }
+    applyRadarResults(data);
   } catch (error) {
-    state.radar = { ...(state.radar || {}), status: "error", error: error.message };
+    if (sessionId !== state.captureSessionId) return;
+    const reconnecting = error.name === "AbortError" || error instanceof TypeError;
+    state.radar = { ...(state.radar || {}), status: reconnecting ? "ready" : "error", error: error.message };
     renderRadar();
     saveWorkspace();
-    setCaptureStatus("岗位池整理失败", error.message, "error");
-    showToast(error.name === "AbortError" ? "统一匹配超时，可稍后点击停止并重试整理" : error.message);
+    setCaptureStatus(reconnecting ? "正在等待本地助手恢复连接" : "岗位池整理失败", reconnecting ? "已采集的岗位会保留，恢复连接后自动同步结果。" : error.message, "error");
+    showToast(reconnecting ? "连接暂时中断，稍后会自动同步匹配结果" : error.message);
   } finally {
     state.radarFinalizing = false;
     renderRadar();
   }
 }
 
+function applyRadarResults(data) {
+  state.jobs = mergeRadarJobs(data.jobs || []);
+  state.visibleJobs = state.jobs;
+  state.radar = data.radar;
+  state.radarResultsLoaded = state.captureSessionId;
+  state.jobSource = "岗位雷达真实岗位";
+  state.extensionPlatforms = ["智联招聘", "BOSS直聘"];
+  refreshFilterOptions(true);
+  applyEngine(data.engine);
+  updateResultTabs();
+  filterAndRender();
+  renderRadar();
+  updateSourceNotice(data.source);
+  saveWorkspace();
+  els.captureStatus.classList.add("hidden");
+  showToast("岗位雷达已自动完成匹配，可以查看推荐结果");
+}
+
 async function checkRadarStatus() {
-  if (!state.profile || !state.radar || state.radarFinalizing || ["idle", "finalized", "error"].includes(state.radar.status)) return;
+  if (!state.profile || !state.radar || state.radarFinalizing || state.radarChecking || ["idle", "error"].includes(state.radar.status)) return;
+  if (state.radar.status === "finalized" && state.radarResultsLoaded === state.captureSessionId) return;
+  const sessionId = state.captureSessionId;
+  state.radarChecking = true;
   try {
-    const response = await fetch(`/api/radar/status?session=${encodeURIComponent(state.captureSessionId)}`, { cache: "no-store" });
+    const response = await fetchWithTimeout(`/api/radar/status?session=${encodeURIComponent(sessionId)}`, { cache: "no-store" }, 10000);
     const data = await response.json();
-    if (!response.ok || !data.radar) return;
+    if (!response.ok || !data.radar || sessionId !== state.captureSessionId) return;
     state.radar = data.radar;
     renderRadar();
     saveWorkspace();
@@ -1049,7 +1074,13 @@ async function checkRadarStatus() {
       state.blockedNotified = false;
     }
     if (state.radar.status === "ready") await finalizeRadar();
-  } catch { /* 本地服务重启后继续等待用户重新开始雷达 */ }
+    else if (state.radar.status === "finalized") {
+      const resultResponse = await fetchWithTimeout(`/api/radar/results?session=${encodeURIComponent(sessionId)}`, { cache: "no-store" }, 10000);
+      const result = await resultResponse.json();
+      if (resultResponse.ok && result.ready && sessionId === state.captureSessionId) applyRadarResults(result);
+    }
+  } catch { /* 本地服务恢复后下一轮轮询会继续同步进度和结果。 */ }
+  finally { state.radarChecking = false; }
 }
 
 function notifyRadarBlocked(reason) {
